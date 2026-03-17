@@ -1,4 +1,3 @@
 [submodule "tools/GenSMBIOS"]
 	path = tools/GenSMBIOS
-	url = https://github.com/jaminmc/GenSMBIOS.git
-	branch = AddCli
+	url = https://github.com/corpnewt/GenSMBIOS.git
