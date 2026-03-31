@@ -329,7 +329,7 @@ setup_prerequisites() {
   printf "alias osx-setup='%s/setup'\n" "$SCRIPT_DIR" >> /root/.bashrc
   printf "LANG=en_US.UTF-8\nLC_ALL=en_US.UTF-8\n" > /etc/environment
   printf "set mouse-=a\n" > ~/.vimrc
-  rm -f /etc/apt/sources.list.d/pve-enterprise.list
+  rm -f /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.sources
   apt-get update >>"$logfile" 2>&1 || {
     local country=$(curl -s https://ipinfo.io/country | tr '[:upper:]' '[:lower:]')
     if [[ "$PVE_MAJOR" -ge 9 ]]; then
@@ -459,13 +459,13 @@ create_vm() {
 # Function to add Proxmox VE no-subscription repository
 add_no_subscription_repo() {
   local logfile="${LOGDIR}/add-repo-pve-no-subscription.log"
-  if pveversion | grep -q "pve-manager/[7]"; then
+  if [[ "$PVE_MAJOR" -eq 7 ]]; then
     rm -f /etc/apt/sources.list.d/pve-no-sub.sources
     printf "deb http://download.proxmox.com/debian/pve bullseye pve-no-subscription\n" > /etc/apt/sources.list.d/pve-no-sub.list
-  elif pveversion | grep -q "pve-manager/[8]"; then
+  elif [[ "$PVE_MAJOR" -eq 8 ]]; then
     rm -f /etc/apt/sources.list.d/pve-no-sub.sources
     printf "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription\n" > /etc/apt/sources.list.d/pve-no-sub.list
-  elif pveversion | grep -q "pve-manager/[9]"; then
+  elif [[ "$PVE_MAJOR" -eq 9 ]]; then
     rm -f /etc/apt/sources.list.d/pve-no-sub.list
     printf "Types: deb\nURIs: http://download.proxmox.com/debian/pve\nSuites: trixie\nComponents: pve-no-subscription\nSigned-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n" > /etc/apt/sources.list.d/pve-no-sub.sources
   else
