@@ -37,7 +37,7 @@ SCRIPT_DIR="/root/OSX-PROXMOX"
 LOGDIR="${SCRIPT_DIR}/logs"
 MAIN_LOG="${LOGDIR}/main.log"
 TMPDIR="${SCRIPT_DIR}/tmp"
-HACKPXVERSION="2025.07.23"
+HACKPXVERSION="2026.03.31"
 OCVERSION="1.0.4"
 DEFAULT_VM_PREFIX="HACK-"
 BASE_RAM_SIZE=4096
@@ -313,11 +313,8 @@ check_proxmox_version() {
     log_and_exit "Unsupported Proxmox version. Use 7.x, 8.x, or 9.x" "$log_file"
   fi
 
-  # Warn about preliminary Proxmox 9 support
-  if [[ "$version" == pve-manager/9.* ]]; then
-    display_and_log "Proxmox 9 is in preliminary testing. Use at your own risk." "$log_file"
-    sleep 5
-  fi
+  # Export major version for use throughout the script
+  PVE_MAJOR=$(pveversion | grep -oP 'pve-manager/\K[0-9]+')
 }
 
 # Function to detect CPU platform
@@ -335,7 +332,11 @@ setup_prerequisites() {
   rm -f /etc/apt/sources.list.d/pve-enterprise.list
   apt-get update >>"$logfile" 2>&1 || {
     local country=$(curl -s https://ipinfo.io/country | tr '[:upper:]' '[:lower:]')
-    sed -i "s/ftp.$country.debian.org/ftp.debian.org/g" /etc/apt/sources.list
+    if [[ "$PVE_MAJOR" -ge 9 ]]; then
+      sed -i "s|ftp.$country.debian.org|ftp.debian.org|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+    else
+      sed -i "s/ftp.$country.debian.org/ftp.debian.org/g" /etc/apt/sources.list
+    fi
     apt-get update >>"$logfile" 2>&1 || log_and_exit "Failed to update apt" "$logfile"
   }
   apt-get install -y vim unzip zip sysstat parted wget iptraf git htop ipcalc coreutils vim-common xmlstarlet >>"$logfile" 2>&1 || log_and_exit "Failed to install packages" "$logfile"
@@ -348,13 +349,24 @@ setup_prerequisites() {
     grub_cmd="quiet intel_iommu=on iommu=pt video=vesafb:off video=efifb:off"
     printf "options kvm-intel nested=Y\n" > /etc/modprobe.d/kvm-intel.conf
   fi
-  pveversion | grep -qE "pve-manager/(7.[2-4]|8.[0-4]|9)" && grub_cmd="$grub_cmd initcall_blacklist=sysfb_init"
+  pveversion | grep -qE "pve-manager/(7\.[2-9]|8\.|9\.)" && grub_cmd="$grub_cmd initcall_blacklist=sysfb_init"
   sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"/GRUB_CMDLINE_LINUX_DEFAULT=\"$grub_cmd\"/g" /etc/default/grub
-  printf "vfio\nvfio_iommu_type1\nvfio_pci\nvfio_virqfd\n" >> /etc/modules
+  local vfio_modules="vfio\nvfio_iommu_type1\nvfio_pci"
+  if [[ "$PVE_MAJOR" -lt 9 ]]; then
+    vfio_modules="$vfio_modules\nvfio_virqfd"
+  fi
+  printf "$vfio_modules\n" >> /etc/modules
   printf "blacklist nouveau\nblacklist nvidia\nblacklist snd_hda_codec_hdmi\nblacklist snd_hda_intel\nblacklist snd_hda_codec\nblacklist snd_hda_core\nblacklist radeon\nblacklist amdgpu\n" >> /etc/modprobe.d/pve-blacklist.conf
   printf "options kvm ignore_msrs=Y report_ignored_msrs=0\n" > /etc/modprobe.d/kvm.conf
   printf "options vfio_iommu_type1 allow_unsafe_interrupts=1\n" > /etc/modprobe.d/iommu_unsafe_interrupts.conf
-  [ -f /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js ] && sed -i.backup -z "s/res === null || res === undefined || \!res || res\n\t\t\t.data.status.toLowerCase() \!== 'active'/false/g" /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
+  local proxmox_js="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
+  if [ -f "$proxmox_js" ]; then
+    if grep -qz "res === null || res === undefined" "$proxmox_js"; then
+      sed -i.backup -z "s/res === null || res === undefined || \!res || res\n\t\t\t.data.status.toLowerCase() \!== 'active'/false/g" "$proxmox_js"
+    else
+      display_and_log "WARNING: Subscription nag patch pattern not found in proxmoxlib.js (PVE version may have changed the format)" "$logfile"
+    fi
+  fi
   touch /etc/pve/qemu-server/.osx-proxmox
   update-grub >>"$logfile" 2>&1 || log_and_exit "Failed to update GRUB" "$logfile"
   display_and_log "Prerequisites setup complete. A reboot is necessary to apply the required changes. Press enter to reboot or Ctrl+C if you intend to reboot later." "$logfile"
@@ -417,11 +429,17 @@ create_vm() {
   local qemu_version=$(qemu-system-x86_64 --version | awk '/version/ {print $4}' | cut -d'(' -f1)
   version_compare "$qemu_version" "6.1" && device_args="$device_args -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"
 
+  # Pin machine type to avoid QEMU 10.x blockdev issues on PVE 9
+  local machine_type="q35"
+  if [[ "$PVE_MAJOR" -ge 9 ]]; then
+    machine_type="pc-q35-9.2+pve1"
+  fi
+
   qm create "$vm_id" \
     --agent 1 --args "$device_args $cpu_args" --autostart 0 \
     --balloon 0 --bios ovmf --boot "order=ide0;$disk_type" \
     --cores "$core_count" --description "Hackintosh VM - $version_name" \
-    --efidisk0 "${storage}:4" --machine q35 --memory "$ram_size" \
+    --efidisk0 "${storage}:4" --machine "$machine_type" --memory "$ram_size" \
     --name "$vm_name" --net0 "vmxnet3,bridge=$bridge" --numa 0 \
     --onboot 0 --ostype other --sockets 1 --start 0 --tablet 1 \
     --vga vmware --vmgenid 1 --scsihw virtio-scsi-pci \
@@ -442,10 +460,13 @@ create_vm() {
 add_no_subscription_repo() {
   local logfile="${LOGDIR}/add-repo-pve-no-subscription.log"
   if pveversion | grep -q "pve-manager/[7]"; then
+    rm -f /etc/apt/sources.list.d/pve-no-sub.sources
     printf "deb http://download.proxmox.com/debian/pve bullseye pve-no-subscription\n" > /etc/apt/sources.list.d/pve-no-sub.list
   elif pveversion | grep -q "pve-manager/[8]"; then
+    rm -f /etc/apt/sources.list.d/pve-no-sub.sources
     printf "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription\n" > /etc/apt/sources.list.d/pve-no-sub.list
   elif pveversion | grep -q "pve-manager/[9]"; then
+    rm -f /etc/apt/sources.list.d/pve-no-sub.list
     printf "Types: deb\nURIs: http://download.proxmox.com/debian/pve\nSuites: trixie\nComponents: pve-no-subscription\nSigned-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n" > /etc/apt/sources.list.d/pve-no-sub.sources
   else
     log_and_exit "Unsupported Proxmox version" "$logfile"
