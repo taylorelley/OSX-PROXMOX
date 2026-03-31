@@ -16,8 +16,7 @@ Easily install macOS on Proxmox VE with just a few steps! This guide provides th
 
 ## 🛠 Installation Guide
 
-1. Install a **FRESH/CLEAN** version of Proxmox VE (v7.0.XX ~ 8.4.XX) - just follow the Next, Next & Finish (NNF) approach.
-   * Preliminary support for Proxmox VE V9.0.0 BETA.
+1. Install a **FRESH/CLEAN** version of Proxmox VE (v7.0.XX ~ 9.1.XX) - just follow the Next, Next & Finish (NNF) approach.
 2. Open the **Proxmox Web Console** → Navigate to `Datacenter > YOUR_HOST_NAME > Shell`.
 3. Copy, paste, and execute the command below:
 
@@ -52,7 +51,7 @@ sudo spctl --master-disable
 ---
 
 ## 🖥 Proxmox VE Versions Supported
-✅ v7.0.XX ~ 8.4.XX
+✅ v7.0.XX ~ 9.1.XX
 
 ### 🔄 OpenCore Version
 - **April/2025 - 1.0.4** → with SIP Enabled, DMG only signed by Apple and all features of securities
