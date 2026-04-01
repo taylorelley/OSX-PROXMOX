@@ -62,6 +62,150 @@ declare -A MACOS_CONFIG=(
   ["8"]="Sequoia|15|Mac-7BA5B2D9E42DDD94|00000000000000000|1450M|virtio0"
 )
 
+# Parse command-line flags
+DRY_RUN=false
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+  esac
+done
+
+BACKUP_DIR="${BACKUP_DIR:-/root/.osx-proxmox-backups}"
+
+# Create a backup of system configuration files before making changes
+create_system_backup() {
+  BACKUP_DIR="${BACKUP_DIR}/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$BACKUP_DIR"
+  [ -f /etc/default/grub ] && cp -a /etc/default/grub "$BACKUP_DIR/"
+  [ -f /etc/modules ] && cp -a /etc/modules "$BACKUP_DIR/"
+  [ -d /etc/modprobe.d ] && cp -a /etc/modprobe.d "$BACKUP_DIR/"
+  [ -d /etc/apt/sources.list.d ] && cp -a /etc/apt/sources.list.d "$BACKUP_DIR/"
+  [ -f /etc/apt/sources.list ] && cp -a /etc/apt/sources.list "$BACKUP_DIR/"
+  [ -f /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js ] && cp -a /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js "$BACKUP_DIR/"
+  echo "$BACKUP_DIR"
+}
+
+# Restore system configuration from a backup directory
+restore_system_backup() {
+  local backup="$1"
+  if [ ! -d "$backup" ]; then
+    echo "ERROR: Backup directory not found: $backup"
+    return 1
+  fi
+  echo "Restoring system configuration from: $backup"
+  [ -f "$backup/grub" ] && cp -a "$backup/grub" /etc/default/grub && update-grub 2>/dev/null
+  [ -f "$backup/modules" ] && cp -a "$backup/modules" /etc/modules
+  [ -d "$backup/modprobe.d" ] && rsync -a --delete "$backup/modprobe.d/" /etc/modprobe.d/
+  [ -d "$backup/sources.list.d" ] && rsync -a --delete "$backup/sources.list.d/" /etc/apt/sources.list.d/
+  [ -f "$backup/sources.list" ] && cp -a "$backup/sources.list" /etc/apt/sources.list
+  [ -f "$backup/proxmoxlib.js" ] && cp -a "$backup/proxmoxlib.js" /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
+  echo "Restore complete. A reboot may be required for kernel/GRUB changes to take effect."
+}
+
+# Pre-flight check: detect existing workloads and warn the user
+preflight_check() {
+  local logfile="${LOGDIR}/preflight-check.log"
+  local has_warnings=false
+
+  echo ""
+  echo "=============================================="
+  echo "  OSX-PROXMOX Pre-Flight Safety Check"
+  echo "=============================================="
+  echo ""
+
+  # Detect existing VMs
+  local vm_count=0
+  if command -v qm &>/dev/null; then
+    vm_count=$(qm list 2>/dev/null | tail -n +2 | wc -l)
+    if [ "$vm_count" -gt 0 ]; then
+      has_warnings=true
+      echo "WARNING: Found $vm_count existing VM(s):"
+      qm list 2>/dev/null | tail -n +2 | while read -r line; do echo "  $line"; done
+      echo ""
+    fi
+  fi
+
+  # Detect existing LXCs
+  local lxc_count=0
+  if command -v pct &>/dev/null; then
+    lxc_count=$(pct list 2>/dev/null | tail -n +2 | wc -l)
+    if [ "$lxc_count" -gt 0 ]; then
+      has_warnings=true
+      echo "WARNING: Found $lxc_count existing LXC container(s):"
+      pct list 2>/dev/null | tail -n +2 | while read -r line; do echo "  $line"; done
+      echo ""
+    fi
+  fi
+
+  # Check for existing PCI passthrough configurations
+  local pci_passthrough_vms=""
+  if [ -d /etc/pve/qemu-server ]; then
+    pci_passthrough_vms=$(grep -rl "hostpci" /etc/pve/qemu-server/ 2>/dev/null || true)
+    if [ -n "$pci_passthrough_vms" ]; then
+      has_warnings=true
+      echo "WARNING: Found existing PCI passthrough configurations:"
+      for cfg in $pci_passthrough_vms; do
+        local vmid=$(basename "$cfg" .conf)
+        echo "  VM $vmid: $(grep 'hostpci' "$cfg" 2>/dev/null)"
+      done
+      echo "  IOMMU group assignments may change after the required reboot!"
+      echo ""
+    fi
+  fi
+
+  # Check for existing custom modprobe configs that would be overwritten
+  if [ -f /etc/modprobe.d/kvm.conf ]; then
+    has_warnings=true
+    echo "WARNING: Existing /etc/modprobe.d/kvm.conf will be backed up and overwritten."
+    echo "  Current content: $(cat /etc/modprobe.d/kvm.conf 2>/dev/null)"
+    echo ""
+  fi
+
+  # Check for Proxmox subscription
+  if [ -f /etc/subscription ] || pvesubscriptionget 2>/dev/null | grep -q "status.*Active" 2>/dev/null; then
+    has_warnings=true
+    echo "WARNING: Active Proxmox subscription detected."
+    echo "  Enterprise repositories may be disabled during setup."
+    echo ""
+  fi
+
+  # Summary of changes that will be made
+  echo "The following system changes will be made:"
+  echo "  - GRUB kernel parameters modified (IOMMU enabled)"
+  echo "  - VFIO kernel modules added to /etc/modules"
+  echo "  - KVM modprobe configs created/updated in /etc/modprobe.d/"
+  echo "  - Packages installed: vim, unzip, zip, sysstat, parted, wget, etc."
+  echo "  - A system reboot will be required"
+  echo ""
+
+  if $has_warnings; then
+    echo "=============================================="
+    echo "  WARNINGS DETECTED - Review above carefully"
+    echo "=============================================="
+    echo ""
+    echo "A full backup of affected system files will be created before any changes."
+  fi
+
+  if $DRY_RUN; then
+    echo ""
+    echo "[DRY-RUN MODE] No changes will be made. Exiting."
+    exit 0
+  fi
+
+  if [ -t 0 ]; then
+    echo ""
+    read -p "Do you want to proceed with setup? (y/N): " proceed_choice
+    if [[ "$proceed_choice" != [yY] ]]; then
+      echo "Setup cancelled by user."
+      exit 0
+    fi
+  else
+    echo "Non-interactive shell detected — aborting setup."
+    echo "Run this script in an interactive terminal to proceed with prerequisites."
+    exit 1
+  fi
+}
+
 # Display and log function
 display_and_log() {
   local message="$1"
@@ -325,18 +469,43 @@ detect_cpu_platform() {
 # Function to setup prerequisites
 setup_prerequisites() {
   local logfile="${LOGDIR}/prerequisites-setup.log"
+  # Create a backup of all system files that will be modified
+  local backup_path
+  backup_path=$(create_system_backup)
+  display_and_log "System configuration backed up to: $backup_path" "$logfile"
+  display_and_log "To restore, run: $SCRIPT_DIR/setup --restore $backup_path" "$logfile"
+  echo ""
   cp "${SCRIPT_DIR}/EFI/"*.iso "$ISODIR" || log_and_exit "Failed to copy EFI files" "$logfile"
   printf "alias osx-setup='%s/setup'\n" "$SCRIPT_DIR" >> /root/.bashrc
   # Append locale settings instead of overwriting to preserve existing environment variables
   grep -q "LANG=en_US.UTF-8" /etc/environment 2>/dev/null || printf "LANG=en_US.UTF-8\n" >> /etc/environment
   grep -q "LC_ALL=en_US.UTF-8" /etc/environment 2>/dev/null || printf "LC_ALL=en_US.UTF-8\n" >> /etc/environment
   printf "set mouse-=a\n" > ~/.vimrc
-  # Only remove enterprise/ceph repos if they exist, with a warning
+  # Only remove enterprise/ceph repos if they exist and user confirms
   if [ -f /etc/apt/sources.list.d/pve-enterprise.list ] || [ -f /etc/apt/sources.list.d/pve-enterprise.sources ] || \
      [ -f /etc/apt/sources.list.d/ceph.list ] || [ -f /etc/apt/sources.list.d/ceph.sources ]; then
-    display_and_log "WARNING: Removing Proxmox enterprise and Ceph repository files. If you have a valid subscription, you may want to restore these later." "$logfile"
-    rm -f /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.sources \
-          /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.sources
+    local remove_repos=false
+    if [ -t 0 ]; then
+      echo ""
+      echo "Proxmox enterprise and/or Ceph repository files were found."
+      echo "These must be removed or disabled to use the free no-subscription repository."
+      echo "If you have a valid subscription, the files will be backed up with a .disabled suffix."
+      read -p "Disable enterprise/ceph repositories? (y/N): " repo_choice
+      [[ "$repo_choice" == [yY] ]] && remove_repos=true
+    else
+      display_and_log "Non-interactive mode: skipping enterprise/ceph repository removal." "$logfile"
+    fi
+    if $remove_repos; then
+      for repo_file in /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.sources \
+                       /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.sources; do
+        if [ -f "$repo_file" ]; then
+          mv "$repo_file" "${repo_file}.disabled"
+          display_and_log "Disabled: $repo_file (backed up to ${repo_file}.disabled)" "$logfile"
+        fi
+      done
+    else
+      display_and_log "Skipping enterprise/ceph repository removal per user choice." "$logfile"
+    fi
   fi
   apt-get update >>"$logfile" 2>&1 || {
     local country=$(curl -s https://ipinfo.io/country | tr '[:upper:]' '[:lower:]')
@@ -348,7 +517,16 @@ setup_prerequisites() {
     apt-get update >>"$logfile" 2>&1 || log_and_exit "Failed to update apt" "$logfile"
   }
   apt-get install -y vim unzip zip sysstat parted wget iptraf git htop ipcalc coreutils vim-common xmlstarlet >>"$logfile" 2>&1 || log_and_exit "Failed to install packages" "$logfile"
-  sed -i 's/GRUB_TIMEOUT=5/GRUB_TIMEOUT=0/g' /etc/default/grub
+  # Only change GRUB timeout if user confirms (cosmetic change)
+  if [ -t 0 ]; then
+    local current_timeout=$(grep -oP 'GRUB_TIMEOUT=\K[0-9]+' /etc/default/grub 2>/dev/null || echo "5")
+    if [ "$current_timeout" != "0" ]; then
+      read -p "Set GRUB boot timeout to 0 seconds? Current: ${current_timeout}s (y/N): " timeout_choice
+      if [[ "$timeout_choice" == [yY] ]]; then
+        sed -i "s/GRUB_TIMEOUT=$current_timeout/GRUB_TIMEOUT=0/g" /etc/default/grub
+      fi
+    fi
+  fi
   local grub_cmd="quiet"
   local grub_needs_update=false
   if [[ $OSX_PLATFORM == "AMD" ]]; then
@@ -419,15 +597,43 @@ setup_prerequisites() {
   else
     display_and_log "Skipping GPU/audio driver blacklisting per user choice." "$logfile"
   fi
-  printf "options kvm ignore_msrs=Y report_ignored_msrs=0\n" > /etc/modprobe.d/kvm.conf
-  printf "options vfio_iommu_type1 allow_unsafe_interrupts=1\n" > /etc/modprobe.d/iommu_unsafe_interrupts.conf
-  local proxmox_js="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
-  if [ -f "$proxmox_js" ]; then
-    if grep -qz "res === null || res === undefined" "$proxmox_js"; then
-      sed -i.backup -z "s/res === null || res === undefined || \!res || res\n\t\t\t.data.status.toLowerCase() \!== 'active'/false/g" "$proxmox_js"
-    else
-      display_and_log "WARNING: Subscription nag patch pattern not found in proxmoxlib.js (PVE version may have changed the format)" "$logfile"
+  # Back up existing modprobe configs before overwriting
+  if [ -f /etc/modprobe.d/kvm.conf ] && ! grep -q "ignore_msrs=Y" /etc/modprobe.d/kvm.conf 2>/dev/null; then
+    cp /etc/modprobe.d/kvm.conf /etc/modprobe.d/kvm.conf.bak-osx-proxmox
+    display_and_log "Backed up existing /etc/modprobe.d/kvm.conf to kvm.conf.bak-osx-proxmox" "$logfile"
+  fi
+  if ! grep -q "ignore_msrs=Y" /etc/modprobe.d/kvm.conf 2>/dev/null; then
+    printf "options kvm ignore_msrs=Y report_ignored_msrs=0\n" > /etc/modprobe.d/kvm.conf
+  fi
+  if [ -f /etc/modprobe.d/iommu_unsafe_interrupts.conf ] && ! grep -q "allow_unsafe_interrupts=1" /etc/modprobe.d/iommu_unsafe_interrupts.conf 2>/dev/null; then
+    cp /etc/modprobe.d/iommu_unsafe_interrupts.conf /etc/modprobe.d/iommu_unsafe_interrupts.conf.bak-osx-proxmox
+    display_and_log "Backed up existing /etc/modprobe.d/iommu_unsafe_interrupts.conf" "$logfile"
+  fi
+  if ! grep -q "allow_unsafe_interrupts=1" /etc/modprobe.d/iommu_unsafe_interrupts.conf 2>/dev/null; then
+    printf "options vfio_iommu_type1 allow_unsafe_interrupts=1\n" > /etc/modprobe.d/iommu_unsafe_interrupts.conf
+  fi
+  # Subscription nag removal is opt-in (also available via menu option 203)
+  local patch_nag=false
+  if [ -t 0 ]; then
+    echo ""
+    echo "Optional: Remove the Proxmox subscription notice from the web UI."
+    echo "This patches proxmoxlib.js (a backup will be created)."
+    echo "You can also do this later from the menu (option 203)."
+    read -p "Remove subscription notice now? (y/N): " nag_choice
+    [[ "$nag_choice" == [yY] ]] && patch_nag=true
+  fi
+  if $patch_nag; then
+    local proxmox_js="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
+    if [ -f "$proxmox_js" ]; then
+      if grep -qz "res === null || res === undefined" "$proxmox_js"; then
+        sed -i.backup -z "s/res === null || res === undefined || \!res || res\n\t\t\t.data.status.toLowerCase() \!== 'active'/false/g" "$proxmox_js"
+        display_and_log "Subscription notice removed (backup: ${proxmox_js}.backup)" "$logfile"
+      else
+        display_and_log "WARNING: Subscription nag patch pattern not found in proxmoxlib.js (PVE version may have changed the format)" "$logfile"
+      fi
     fi
+  else
+    display_and_log "Skipping subscription notice removal. Use menu option 203 to apply later." "$logfile"
   fi
   touch /etc/pve/qemu-server/.osx-proxmox
   if $grub_needs_update; then
@@ -437,20 +643,42 @@ setup_prerequisites() {
   display_and_log "Prerequisites setup complete. A reboot is required to apply kernel/GRUB changes." "$logfile"
   if [ -t 0 ]; then
     echo ""
-    echo "WARNING: If you have running VMs or LXCs, please shut them down gracefully BEFORE rebooting."
-    echo ""
-    echo "Options:"
-    echo "  1) Reboot now (will forcefully stop any running VMs/LXCs)"
-    echo "  2) Skip reboot (you must reboot manually later before creating macOS VMs)"
-    echo ""
-    read -p "Choose [1/2]: " reboot_choice
-    if [[ "$reboot_choice" == "1" ]]; then
-      display_and_log "User chose to reboot now. Rebooting in 15 seconds..." "$logfile"
-      sleep 15 && reboot
-    else
-      display_and_log "Reboot skipped. Please reboot manually when ready (after shutting down VMs/LXCs)." "$logfile"
+    # Check for running VMs and LXCs before offering reboot
+    local running_vms=0
+    local running_lxcs=0
+    if command -v qm &>/dev/null; then
+      running_vms=$(qm list 2>/dev/null | { grep -c "running" || true; })
+    fi
+    if command -v pct &>/dev/null; then
+      running_lxcs=$(pct list 2>/dev/null | { grep -c "running" || true; })
+    fi
+    if [ "$running_vms" -gt 0 ] || [ "$running_lxcs" -gt 0 ]; then
+      echo "=============================================="
+      echo "  RUNNING WORKLOADS DETECTED"
+      echo "=============================================="
+      [ "$running_vms" -gt 0 ] && echo "  Running VMs: $running_vms"
+      [ "$running_lxcs" -gt 0 ] && echo "  Running LXCs: $running_lxcs"
       echo ""
-      echo "Run 'reboot' when you are ready."
+      echo "A reboot is required, but you have running workloads."
+      echo "Please shut down all VMs and LXCs gracefully, then run 'reboot'."
+      echo ""
+      display_and_log "Reboot deferred: $running_vms running VM(s), $running_lxcs running LXC(s) detected." "$logfile"
+    else
+      echo "No running VMs or LXCs detected."
+      echo ""
+      echo "Options:"
+      echo "  1) Reboot now"
+      echo "  2) Skip reboot (you must reboot manually later before creating macOS VMs)"
+      echo ""
+      read -p "Choose [1/2]: " reboot_choice
+      if [[ "$reboot_choice" == "1" ]]; then
+        display_and_log "User chose to reboot now. Rebooting in 15 seconds..." "$logfile"
+        sleep 15 && reboot
+      else
+        display_and_log "Reboot skipped. Please reboot manually when ready." "$logfile"
+        echo ""
+        echo "Run 'reboot' when you are ready."
+      fi
     fi
   else
     display_and_log "Non-interactive mode: skipping reboot. Please reboot manually when ready." "$logfile"
@@ -974,6 +1202,18 @@ clear_recovery_images() {
 
 # Function to remove subscription notice
 remove_subscription_notice() {
+  echo ""
+  echo "This will:"
+  echo "  1. Remove the Proxmox subscription notice from the web UI"
+  echo "  2. Create a persistent apt hook (/etc/apt/apt.conf.d/no-nag-script)"
+  echo "     that re-applies the patch after every package update"
+  echo ""
+  read -p "Proceed? (y/N): " nag_confirm
+  if [[ "$nag_confirm" != [yY] ]]; then
+    echo "Cancelled."
+    read -n 1 -sp "Press any key to return to menu..."
+    return
+  fi
   echo "DPkg::Post-Invoke { \"if [ -s /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js ] && ! grep -q -F 'NoMoreNagging' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; then echo 'Removing subscription nag from UI...'; sed -i '/data\.status/{s/\!//;s/active/NoMoreNagging/}' /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js; fi\" };" >/etc/apt/apt.conf.d/no-nag-script
   apt --reinstall install proxmox-widget-toolkit &>/dev/null
   display_and_log "Subscription notice removed"
@@ -1552,6 +1792,25 @@ main_menu() {
 }
 
 # Main script
+
+# Handle --restore flag
+for arg in "$@"; do
+  if [[ "$arg" == "--restore" ]]; then
+    shift
+    restore_system_backup "$1"
+    exit $?
+  fi
+done
+
+# In dry-run mode, run only the read-only preflight check and exit
+# before any side-effectful operations (dir creation, package installs, downloads)
+if $DRY_RUN; then
+  OSX_PLATFORM=$(detect_cpu_platform)
+  preflight_check
+  # preflight_check exits when DRY_RUN is true, but guard here too
+  exit 0
+fi
+
 clear
 init_dirs
 check_proxmox_version
@@ -1562,5 +1821,8 @@ if [ ! -f "${ISODIR}/${OPENCORE_ISO}" ]; then
 fi
 sleep 4
 OSX_PLATFORM=$(detect_cpu_platform)
-[[ ! -e /etc/pve/qemu-server/.osx-proxmox ]] && setup_prerequisites
+if [[ ! -e /etc/pve/qemu-server/.osx-proxmox ]]; then
+  preflight_check
+  setup_prerequisites
+fi
 main_menu

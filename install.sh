@@ -40,15 +40,23 @@ clear
 log_message "Cleaning up existing files..."
 [ -d "/root/OSX-PROXMOX" ] && rm -rf "/root/OSX-PROXMOX"
 
-# Warn before removing enterprise/ceph repo files (may be needed for subscribed installations)
+# Ask before disabling enterprise/ceph repo files (may be needed for subscribed installations)
 if [ -f "/etc/apt/sources.list.d/pve-enterprise.list" ] || [ -f "/etc/apt/sources.list.d/pve-enterprise.sources" ] || \
    [ -f "/etc/apt/sources.list.d/ceph.list" ] || [ -f "/etc/apt/sources.list.d/ceph.sources" ]; then
-    log_message "WARNING: Removing Proxmox enterprise and Ceph repository files."
-    log_message "If you have a valid Proxmox subscription, you may want to restore these later."
-    [ -f "/etc/apt/sources.list.d/pve-enterprise.list" ] && rm -f "/etc/apt/sources.list.d/pve-enterprise.list"
-    [ -f "/etc/apt/sources.list.d/ceph.list" ] && rm -f "/etc/apt/sources.list.d/ceph.list"
-    [ -f "/etc/apt/sources.list.d/pve-enterprise.sources" ] && rm -f "/etc/apt/sources.list.d/pve-enterprise.sources"
-    [ -f "/etc/apt/sources.list.d/ceph.sources" ] && rm -f "/etc/apt/sources.list.d/ceph.sources"
+    log_message "Found Proxmox enterprise and/or Ceph repository files."
+    if [ -t 0 ]; then
+        read -p "Disable enterprise/ceph repositories? Files will be backed up with .disabled suffix. (y/N): " repo_choice
+        if [[ "$repo_choice" == [yY] ]]; then
+            for repo_file in /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.sources \
+                             /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.sources; do
+                [ -f "$repo_file" ] && mv "$repo_file" "${repo_file}.disabled" && log_message "Disabled: $repo_file"
+            done
+        else
+            log_message "Skipping enterprise/ceph repository removal per user choice."
+        fi
+    else
+        log_message "Non-interactive mode: skipping enterprise/ceph repository removal."
+    fi
 fi
 
 log_message "Preparing to install OSX-PROXMOX..."
