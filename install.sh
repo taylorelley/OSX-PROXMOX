@@ -39,10 +39,17 @@ clear
 # Clean up existing files
 log_message "Cleaning up existing files..."
 [ -d "/root/OSX-PROXMOX" ] && rm -rf "/root/OSX-PROXMOX"
-[ -f "/etc/apt/sources.list.d/pve-enterprise.list" ] && rm -f "/etc/apt/sources.list.d/pve-enterprise.list"
-[ -f "/etc/apt/sources.list.d/ceph.list" ] && rm -f "/etc/apt/sources.list.d/ceph.list"
-[ -f "/etc/apt/sources.list.d/pve-enterprise.sources" ] && rm -f "/etc/apt/sources.list.d/pve-enterprise.sources"
-[ -f "/etc/apt/sources.list.d/ceph.sources" ] && rm -f "/etc/apt/sources.list.d/ceph.sources"
+
+# Warn before removing enterprise/ceph repo files (may be needed for subscribed installations)
+if [ -f "/etc/apt/sources.list.d/pve-enterprise.list" ] || [ -f "/etc/apt/sources.list.d/pve-enterprise.sources" ] || \
+   [ -f "/etc/apt/sources.list.d/ceph.list" ] || [ -f "/etc/apt/sources.list.d/ceph.sources" ]; then
+    log_message "WARNING: Removing Proxmox enterprise and Ceph repository files."
+    log_message "If you have a valid Proxmox subscription, you may want to restore these later."
+    [ -f "/etc/apt/sources.list.d/pve-enterprise.list" ] && rm -f "/etc/apt/sources.list.d/pve-enterprise.list"
+    [ -f "/etc/apt/sources.list.d/ceph.list" ] && rm -f "/etc/apt/sources.list.d/ceph.list"
+    [ -f "/etc/apt/sources.list.d/pve-enterprise.sources" ] && rm -f "/etc/apt/sources.list.d/pve-enterprise.sources"
+    [ -f "/etc/apt/sources.list.d/ceph.sources" ] && rm -f "/etc/apt/sources.list.d/ceph.sources"
+fi
 
 log_message "Preparing to install OSX-PROXMOX..."
 

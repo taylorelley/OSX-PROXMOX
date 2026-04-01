@@ -327,9 +327,17 @@ setup_prerequisites() {
   local logfile="${LOGDIR}/prerequisites-setup.log"
   cp "${SCRIPT_DIR}/EFI/"*.iso "$ISODIR" || log_and_exit "Failed to copy EFI files" "$logfile"
   printf "alias osx-setup='%s/setup'\n" "$SCRIPT_DIR" >> /root/.bashrc
-  printf "LANG=en_US.UTF-8\nLC_ALL=en_US.UTF-8\n" > /etc/environment
+  # Append locale settings instead of overwriting to preserve existing environment variables
+  grep -q "LANG=en_US.UTF-8" /etc/environment 2>/dev/null || printf "LANG=en_US.UTF-8\n" >> /etc/environment
+  grep -q "LC_ALL=en_US.UTF-8" /etc/environment 2>/dev/null || printf "LC_ALL=en_US.UTF-8\n" >> /etc/environment
   printf "set mouse-=a\n" > ~/.vimrc
-  rm -f /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.sources
+  # Only remove enterprise/ceph repos if they exist, with a warning
+  if [ -f /etc/apt/sources.list.d/pve-enterprise.list ] || [ -f /etc/apt/sources.list.d/pve-enterprise.sources ] || \
+     [ -f /etc/apt/sources.list.d/ceph.list ] || [ -f /etc/apt/sources.list.d/ceph.sources ]; then
+    display_and_log "WARNING: Removing Proxmox enterprise and Ceph repository files. If you have a valid subscription, you may want to restore these later." "$logfile"
+    rm -f /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.sources \
+          /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.sources
+  fi
   apt-get update >>"$logfile" 2>&1 || {
     local country=$(curl -s https://ipinfo.io/country | tr '[:upper:]' '[:lower:]')
     if [[ "$PVE_MAJOR" -ge 9 ]]; then
@@ -342,21 +350,75 @@ setup_prerequisites() {
   apt-get install -y vim unzip zip sysstat parted wget iptraf git htop ipcalc coreutils vim-common xmlstarlet >>"$logfile" 2>&1 || log_and_exit "Failed to install packages" "$logfile"
   sed -i 's/GRUB_TIMEOUT=5/GRUB_TIMEOUT=0/g' /etc/default/grub
   local grub_cmd="quiet"
+  local grub_needs_update=false
   if [[ $OSX_PLATFORM == "AMD" ]]; then
     grub_cmd="quiet amd_iommu=on iommu=pt video=vesafb:off video=efifb:off"
-    printf "options kvm-amd nested=1\n" > /etc/modprobe.d/kvm-amd.conf
+    if ! grep -rq "nested=1" /etc/modprobe.d/kvm-amd*.conf 2>/dev/null; then
+      printf "options kvm-amd nested=1\n" > /etc/modprobe.d/kvm-amd-nested.conf
+    fi
   else
     grub_cmd="quiet intel_iommu=on iommu=pt video=vesafb:off video=efifb:off"
-    printf "options kvm-intel nested=Y\n" > /etc/modprobe.d/kvm-intel.conf
+    if ! grep -rq "nested=Y" /etc/modprobe.d/kvm-intel*.conf 2>/dev/null; then
+      printf "options kvm-intel nested=Y\n" > /etc/modprobe.d/kvm-intel-nested.conf
+    fi
   fi
   pveversion | grep -qE "pve-manager/(7\.[2-9]|8\.|9\.)" && grub_cmd="$grub_cmd initcall_blacklist=sysfb_init"
-  sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"/GRUB_CMDLINE_LINUX_DEFAULT=\"$grub_cmd\"/g" /etc/default/grub
-  local vfio_modules="vfio\nvfio_iommu_type1\nvfio_pci"
-  if [[ "$PVE_MAJOR" -lt 9 ]]; then
-    vfio_modules="$vfio_modules\nvfio_virqfd"
+  # Read the current GRUB cmdline and merge in any missing flags
+  local current_cmdline
+  current_cmdline=$(grep -oP 'GRUB_CMDLINE_LINUX_DEFAULT="\K[^"]*' /etc/default/grub 2>/dev/null || echo "quiet")
+  # Check for standalone iommu=pt (not amd_iommu or intel_iommu) using word-boundary matching
+  if ! echo " $current_cmdline " | grep -qE '(^| )iommu=(on|pt)( |$)'; then
+    # IOMMU not yet configured — merge all required flags
+    local new_cmdline="$current_cmdline"
+    for flag in $grub_cmd; do
+      if ! echo " $new_cmdline " | grep -qF " $flag "; then
+        new_cmdline="$new_cmdline $flag"
+      fi
+    done
+    # Normalize whitespace
+    new_cmdline=$(echo "$new_cmdline" | xargs)
+    sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\"|GRUB_CMDLINE_LINUX_DEFAULT=\"$new_cmdline\"|g" /etc/default/grub
+    grub_needs_update=true
+    display_and_log "NOTICE: IOMMU has been enabled in GRUB. If you have existing PCI passthrough configurations, IOMMU group assignments may change after reboot." "$logfile"
+  else
+    display_and_log "IOMMU already configured in GRUB, skipping GRUB command line modification." "$logfile"
   fi
-  printf "$vfio_modules\n" >> /etc/modules
-  printf "blacklist nouveau\nblacklist nvidia\nblacklist snd_hda_codec_hdmi\nblacklist snd_hda_intel\nblacklist snd_hda_codec\nblacklist snd_hda_core\nblacklist radeon\nblacklist amdgpu\n" >> /etc/modprobe.d/pve-blacklist.conf
+  # Only add VFIO modules if not already present in /etc/modules
+  local vfio_list=("vfio" "vfio_iommu_type1" "vfio_pci")
+  if [[ "$PVE_MAJOR" -lt 9 ]]; then
+    vfio_list+=("vfio_virqfd")
+  fi
+  for mod in "${vfio_list[@]}"; do
+    if ! grep -q "^${mod}$" /etc/modules 2>/dev/null; then
+      printf "%s\n" "$mod" >> /etc/modules
+    fi
+  done
+  # GPU/audio driver blacklisting is optional — only apply if user confirms
+  # This prevents breaking existing GPU passthrough or host display configurations
+  local blacklist_drivers=false
+  if [ -t 0 ]; then
+    echo ""
+    echo "GPU/Audio driver blacklisting will blacklist the following drivers on the host:"
+    echo "  nouveau, nvidia, radeon, amdgpu, snd_hda_codec_hdmi, snd_hda_intel, snd_hda_codec, snd_hda_core"
+    echo ""
+    echo "This is required for GPU passthrough but may break existing VMs or host display."
+    read -p "Do you want to blacklist GPU/audio drivers? (y/N): " blacklist_choice
+    [[ "$blacklist_choice" == [yY] ]] && blacklist_drivers=true
+  else
+    display_and_log "Non-interactive mode: skipping GPU/audio driver blacklisting." "$logfile"
+  fi
+  if $blacklist_drivers; then
+    # Only append blacklist entries that are not already present
+    local blacklist_mods=("nouveau" "nvidia" "snd_hda_codec_hdmi" "snd_hda_intel" "snd_hda_codec" "snd_hda_core" "radeon" "amdgpu")
+    for drv in "${blacklist_mods[@]}"; do
+      if ! grep -q "^blacklist ${drv}$" /etc/modprobe.d/pve-blacklist.conf 2>/dev/null; then
+        printf "blacklist %s\n" "$drv" >> /etc/modprobe.d/pve-blacklist.conf
+      fi
+    done
+    display_and_log "GPU/audio drivers have been blacklisted." "$logfile"
+  else
+    display_and_log "Skipping GPU/audio driver blacklisting per user choice." "$logfile"
+  fi
   printf "options kvm ignore_msrs=Y report_ignored_msrs=0\n" > /etc/modprobe.d/kvm.conf
   printf "options vfio_iommu_type1 allow_unsafe_interrupts=1\n" > /etc/modprobe.d/iommu_unsafe_interrupts.conf
   local proxmox_js="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
@@ -368,11 +430,31 @@ setup_prerequisites() {
     fi
   fi
   touch /etc/pve/qemu-server/.osx-proxmox
-  update-grub >>"$logfile" 2>&1 || log_and_exit "Failed to update GRUB" "$logfile"
-  display_and_log "Prerequisites setup complete. A reboot is necessary to apply the required changes. Press enter to reboot or Ctrl+C if you intend to reboot later." "$logfile"
-  read noop
-  display_and_log "Enter pressed. Rebooting in 15 seconds..." "$logfile"
-  sleep 15 && reboot
+  if $grub_needs_update; then
+    update-grub >>"$logfile" 2>&1 || log_and_exit "Failed to update GRUB" "$logfile"
+  fi
+  echo ""
+  display_and_log "Prerequisites setup complete. A reboot is required to apply kernel/GRUB changes." "$logfile"
+  if [ -t 0 ]; then
+    echo ""
+    echo "WARNING: If you have running VMs or LXCs, please shut them down gracefully BEFORE rebooting."
+    echo ""
+    echo "Options:"
+    echo "  1) Reboot now (will forcefully stop any running VMs/LXCs)"
+    echo "  2) Skip reboot (you must reboot manually later before creating macOS VMs)"
+    echo ""
+    read -p "Choose [1/2]: " reboot_choice
+    if [[ "$reboot_choice" == "1" ]]; then
+      display_and_log "User chose to reboot now. Rebooting in 15 seconds..." "$logfile"
+      sleep 15 && reboot
+    else
+      display_and_log "Reboot skipped. Please reboot manually when ready (after shutting down VMs/LXCs)." "$logfile"
+      echo ""
+      echo "Run 'reboot' when you are ready."
+    fi
+  else
+    display_and_log "Non-interactive mode: skipping reboot. Please reboot manually when ready." "$logfile"
+  fi
 }
 
 # Function to download recovery image
