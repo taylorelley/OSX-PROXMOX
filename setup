@@ -82,7 +82,11 @@ create_system_backup() {
   [ -d /etc/apt/sources.list.d ] && cp -a /etc/apt/sources.list.d "$BACKUP_DIR/"
   [ -f /etc/apt/sources.list ] && cp -a /etc/apt/sources.list "$BACKUP_DIR/"
   [ -f /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js ] && cp -a /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js "$BACKUP_DIR/"
-  [ -f /etc/environment ] && cp -a /etc/environment "$BACKUP_DIR/"
+  if [ -f /etc/environment ]; then
+    cp -a /etc/environment "$BACKUP_DIR/"
+  else
+    touch "$BACKUP_DIR/ENVIRONMENT_MISSING"
+  fi
   echo "$BACKUP_DIR"
 }
 
@@ -102,7 +106,7 @@ restore_system_backup() {
   [ -f "$backup/proxmoxlib.js" ] && cp -a "$backup/proxmoxlib.js" /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
   if [ -f "$backup/environment" ]; then
     cp -a "$backup/environment" /etc/environment
-  else
+  elif [ -f "$backup/ENVIRONMENT_MISSING" ]; then
     rm -f /etc/environment
   fi
   echo "Restore complete. A reboot may be required for kernel/GRUB changes to take effect."
@@ -571,7 +575,7 @@ setup_prerequisites() {
   fi
   # Check if IOMMU is already enabled via any kernel parameter
   local iommu_already_enabled=false
-  if echo " $current_cmdline " | grep -qE '(^| )(iommu=(on|pt)|intel_iommu=on|amd_iommu=on)( |$)'; then
+  if echo " $current_cmdline " | grep -qE '(^| )(iommu=(on|pt)|intel_iommu=on|amd_iommu=on)(,| |$)'; then
     iommu_already_enabled=true
   fi
   if ! $iommu_already_enabled; then
@@ -603,13 +607,29 @@ setup_prerequisites() {
     grub_needs_update=true
     display_and_log "NOTICE: IOMMU has been enabled in GRUB. If you have existing PCI passthrough configurations, IOMMU group assignments may change after reboot." "$logfile"
   else
-    # IOMMU already configured — but still apply framebuffer flag changes if user opted out
-    if ! $disable_framebuffer; then
-      local stripped_cmdline
-      stripped_cmdline=$(echo "$current_cmdline" | xargs)
-      if [ "$stripped_cmdline" != "$(grep -oP 'GRUB_CMDLINE_LINUX_DEFAULT="\K[^"]*' /etc/default/grub 2>/dev/null)" ]; then
-        sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\"|GRUB_CMDLINE_LINUX_DEFAULT=\"$stripped_cmdline\"|g" /etc/default/grub
-        grub_needs_update=true
+    # IOMMU already configured — still ensure framebuffer flags match user choice
+    local updated_cmdline="$current_cmdline"
+    if $disable_framebuffer; then
+      # Add framebuffer flags if missing
+      for flag in video=vesafb:off video=efifb:off; do
+        if ! echo " $updated_cmdline " | grep -qF " $flag "; then
+          updated_cmdline="$updated_cmdline $flag"
+        fi
+      done
+      local initcall_flag="initcall_blacklist=sysfb_init"
+      if pveversion | grep -qE "pve-manager/(7\.[2-9]|8\.|9\.)"; then
+        if ! echo " $updated_cmdline " | grep -qF " $initcall_flag "; then
+          updated_cmdline="$updated_cmdline $initcall_flag"
+        fi
+      fi
+    fi
+    updated_cmdline=$(echo "$updated_cmdline" | xargs)
+    if [ "$updated_cmdline" != "$(grep -oP 'GRUB_CMDLINE_LINUX_DEFAULT="\K[^"]*' /etc/default/grub 2>/dev/null)" ]; then
+      sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\"|GRUB_CMDLINE_LINUX_DEFAULT=\"$updated_cmdline\"|g" /etc/default/grub
+      grub_needs_update=true
+      if $disable_framebuffer; then
+        display_and_log "Added framebuffer disable flags to GRUB command line." "$logfile"
+      else
         display_and_log "Removed framebuffer disable flags from GRUB command line." "$logfile"
       fi
     fi
@@ -668,23 +688,36 @@ setup_prerequisites() {
     read -p "Enable VFIO unsafe interrupts? (y/N): " unsafe_choice
     [[ "$unsafe_choice" == [yY] ]] && enable_unsafe_interrupts=true
   fi
+  local unsafe_conf="/etc/modprobe.d/iommu_unsafe_interrupts.conf"
   if $enable_unsafe_interrupts; then
-    if [ -f /etc/modprobe.d/iommu_unsafe_interrupts.conf ] && ! grep -q "allow_unsafe_interrupts=1" /etc/modprobe.d/iommu_unsafe_interrupts.conf 2>/dev/null; then
-      cp /etc/modprobe.d/iommu_unsafe_interrupts.conf /etc/modprobe.d/iommu_unsafe_interrupts.conf.bak-osx-proxmox
-      display_and_log "Backed up existing /etc/modprobe.d/iommu_unsafe_interrupts.conf" "$logfile"
-    fi
-    if ! grep -q "allow_unsafe_interrupts=1" /etc/modprobe.d/iommu_unsafe_interrupts.conf 2>/dev/null; then
-      printf "options vfio_iommu_type1 allow_unsafe_interrupts=1\n" > /etc/modprobe.d/iommu_unsafe_interrupts.conf
+    if ! grep -q "allow_unsafe_interrupts=1" "$unsafe_conf" 2>/dev/null; then
+      if [ -f "$unsafe_conf" ]; then
+        cp "$unsafe_conf" "${unsafe_conf}.bak-osx-proxmox"
+        display_and_log "Backed up existing $unsafe_conf" "$logfile"
+        if grep -q "^options vfio_iommu_type1" "$unsafe_conf" 2>/dev/null; then
+          # Append token to existing options line
+          sed -i 's/^options vfio_iommu_type1.*/& allow_unsafe_interrupts=1/' "$unsafe_conf"
+        else
+          # No existing vfio_iommu_type1 line — append a new one
+          printf "options vfio_iommu_type1 allow_unsafe_interrupts=1\n" >> "$unsafe_conf"
+        fi
+      else
+        printf "options vfio_iommu_type1 allow_unsafe_interrupts=1\n" > "$unsafe_conf"
+      fi
+      display_and_log "Enabled VFIO unsafe interrupts." "$logfile"
     fi
   else
-    # User declined — disable any existing allow_unsafe_interrupts=1
-    if [ -f /etc/modprobe.d/iommu_unsafe_interrupts.conf ] && grep -q "allow_unsafe_interrupts=1" /etc/modprobe.d/iommu_unsafe_interrupts.conf 2>/dev/null; then
-      cp /etc/modprobe.d/iommu_unsafe_interrupts.conf /etc/modprobe.d/iommu_unsafe_interrupts.conf.bak-osx-proxmox
-      display_and_log "Backed up existing /etc/modprobe.d/iommu_unsafe_interrupts.conf" "$logfile"
-      sed -i '/allow_unsafe_interrupts=1/d' /etc/modprobe.d/iommu_unsafe_interrupts.conf
+    # User declined — remove only the allow_unsafe_interrupts=1 token, preserving other options
+    if [ -f "$unsafe_conf" ] && grep -q "allow_unsafe_interrupts=1" "$unsafe_conf" 2>/dev/null; then
+      cp "$unsafe_conf" "${unsafe_conf}.bak-osx-proxmox"
+      display_and_log "Backed up existing $unsafe_conf" "$logfile"
+      # Remove the token and collapse extra whitespace
+      sed -i 's/ *allow_unsafe_interrupts=1//g' "$unsafe_conf"
+      # Remove any bare "options vfio_iommu_type1" lines with no remaining options
+      sed -i '/^options vfio_iommu_type1[[:space:]]*$/d' "$unsafe_conf"
       # Remove the file if it's now empty
-      if [ ! -s /etc/modprobe.d/iommu_unsafe_interrupts.conf ]; then
-        rm -f /etc/modprobe.d/iommu_unsafe_interrupts.conf
+      if [ ! -s "$unsafe_conf" ]; then
+        rm -f "$unsafe_conf"
       fi
       display_and_log "Disabled VFIO unsafe interrupts (removed allow_unsafe_interrupts=1)." "$logfile"
     else
