@@ -82,6 +82,11 @@ create_system_backup() {
   [ -d /etc/apt/sources.list.d ] && cp -a /etc/apt/sources.list.d "$BACKUP_DIR/"
   [ -f /etc/apt/sources.list ] && cp -a /etc/apt/sources.list "$BACKUP_DIR/"
   [ -f /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js ] && cp -a /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js "$BACKUP_DIR/"
+  if [ -f /etc/environment ]; then
+    cp -a /etc/environment "$BACKUP_DIR/"
+  else
+    touch "$BACKUP_DIR/ENVIRONMENT_MISSING"
+  fi
   echo "$BACKUP_DIR"
 }
 
@@ -99,6 +104,11 @@ restore_system_backup() {
   [ -d "$backup/sources.list.d" ] && rsync -a --delete "$backup/sources.list.d/" /etc/apt/sources.list.d/
   [ -f "$backup/sources.list" ] && cp -a "$backup/sources.list" /etc/apt/sources.list
   [ -f "$backup/proxmoxlib.js" ] && cp -a "$backup/proxmoxlib.js" /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
+  if [ -f "$backup/environment" ]; then
+    cp -a "$backup/environment" /etc/environment
+  elif [ -f "$backup/ENVIRONMENT_MISSING" ]; then
+    rm -f /etc/environment
+  fi
   echo "Restore complete. A reboot may be required for kernel/GRUB changes to take effect."
 }
 
@@ -137,14 +147,14 @@ preflight_check() {
     fi
   fi
 
-  # Check for existing PCI passthrough configurations
-  local pci_passthrough_vms=""
+  # Check for existing PCI passthrough configurations (global for use in setup_prerequisites)
+  PCI_PASSTHROUGH_VMS=""
   if [ -d /etc/pve/qemu-server ]; then
-    pci_passthrough_vms=$(grep -rl "hostpci" /etc/pve/qemu-server/ 2>/dev/null || true)
-    if [ -n "$pci_passthrough_vms" ]; then
+    PCI_PASSTHROUGH_VMS=$(grep -rl "hostpci" /etc/pve/qemu-server/ 2>/dev/null || true)
+    if [ -n "$PCI_PASSTHROUGH_VMS" ]; then
       has_warnings=true
       echo "WARNING: Found existing PCI passthrough configurations:"
-      for cfg in $pci_passthrough_vms; do
+      for cfg in $PCI_PASSTHROUGH_VMS; do
         local vmid=$(basename "$cfg" .conf)
         echo "  VM $vmid: $(grep 'hostpci' "$cfg" 2>/dev/null)"
       done
@@ -476,11 +486,11 @@ setup_prerequisites() {
   display_and_log "To restore, run: $SCRIPT_DIR/setup --restore $backup_path" "$logfile"
   echo ""
   cp "${SCRIPT_DIR}/EFI/"*.iso "$ISODIR" || log_and_exit "Failed to copy EFI files" "$logfile"
-  printf "alias osx-setup='%s/setup'\n" "$SCRIPT_DIR" >> /root/.bashrc
+  grep -q "alias osx-setup=" /root/.bashrc 2>/dev/null || printf "alias osx-setup='%s/setup'\n" "$SCRIPT_DIR" >> /root/.bashrc
   # Append locale settings instead of overwriting to preserve existing environment variables
   grep -q "LANG=en_US.UTF-8" /etc/environment 2>/dev/null || printf "LANG=en_US.UTF-8\n" >> /etc/environment
   grep -q "LC_ALL=en_US.UTF-8" /etc/environment 2>/dev/null || printf "LC_ALL=en_US.UTF-8\n" >> /etc/environment
-  printf "set mouse-=a\n" > ~/.vimrc
+  grep -q "set mouse-=a" ~/.vimrc 2>/dev/null || printf "set mouse-=a\n" >> ~/.vimrc
   # Only remove enterprise/ceph repos if they exist and user confirms
   if [ -f /etc/apt/sources.list.d/pve-enterprise.list ] || [ -f /etc/apt/sources.list.d/pve-enterprise.sources ] || \
      [ -f /etc/apt/sources.list.d/ceph.list ] || [ -f /etc/apt/sources.list.d/ceph.sources ]; then
@@ -529,24 +539,62 @@ setup_prerequisites() {
   fi
   local grub_cmd="quiet"
   local grub_needs_update=false
+  # Framebuffer disable is recommended for GPU passthrough but can kill local console
+  local disable_framebuffer=true
+  if [ -t 0 ]; then
+    echo ""
+    echo "Disabling host framebuffer drivers (vesafb, efifb) is recommended for GPU passthrough"
+    echo "but will disable the local console display on the host."
+    echo "If you only access this server via SSH or the web UI, this is safe."
+    read -p "Disable host framebuffer drivers? (Y/n): " fb_choice
+    [[ "$fb_choice" == [nN] ]] && disable_framebuffer=false
+  fi
+  local fb_flags=""
+  $disable_framebuffer && fb_flags=" video=vesafb:off video=efifb:off"
   if [[ $OSX_PLATFORM == "AMD" ]]; then
-    grub_cmd="quiet amd_iommu=on iommu=pt video=vesafb:off video=efifb:off"
+    grub_cmd="quiet amd_iommu=on iommu=pt${fb_flags}"
     if ! grep -rq "nested=1" /etc/modprobe.d/kvm-amd*.conf 2>/dev/null; then
       printf "options kvm-amd nested=1\n" > /etc/modprobe.d/kvm-amd-nested.conf
     fi
   else
-    grub_cmd="quiet intel_iommu=on iommu=pt video=vesafb:off video=efifb:off"
+    grub_cmd="quiet intel_iommu=on iommu=pt${fb_flags}"
     if ! grep -rq "nested=Y" /etc/modprobe.d/kvm-intel*.conf 2>/dev/null; then
       printf "options kvm-intel nested=Y\n" > /etc/modprobe.d/kvm-intel-nested.conf
     fi
   fi
-  pveversion | grep -qE "pve-manager/(7\.[2-9]|8\.|9\.)" && grub_cmd="$grub_cmd initcall_blacklist=sysfb_init"
+  # Only add initcall_blacklist=sysfb_init when framebuffer is being disabled
+  if $disable_framebuffer; then
+    pveversion | grep -qE "pve-manager/(7\.[2-9]|8\.|9\.)" && grub_cmd="$grub_cmd initcall_blacklist=sysfb_init"
+  fi
   # Read the current GRUB cmdline and merge in any missing flags
   local current_cmdline
   current_cmdline=$(grep -oP 'GRUB_CMDLINE_LINUX_DEFAULT="\K[^"]*' /etc/default/grub 2>/dev/null || echo "quiet")
-  # Check for standalone iommu=pt (not amd_iommu or intel_iommu) using word-boundary matching
-  if ! echo " $current_cmdline " | grep -qE '(^| )iommu=(on|pt)( |$)'; then
-    # IOMMU not yet configured — merge all required flags
+  # If user opted out of framebuffer disable, strip any existing framebuffer flags from cmdline
+  if ! $disable_framebuffer; then
+    current_cmdline=$(echo "$current_cmdline" | sed -e 's/ *video=vesafb:off//g' -e 's/ *video=efifb:off//g' -e 's/ *initcall_blacklist=sysfb_init//g')
+  fi
+  # Check if IOMMU is already enabled via any kernel parameter
+  local iommu_already_enabled=false
+  if echo " $current_cmdline " | grep -qE '(^| )(iommu=(on|pt)|intel_iommu=on|amd_iommu=on)(,| |$)'; then
+    iommu_already_enabled=true
+  fi
+  if ! $iommu_already_enabled; then
+    # IOMMU not yet configured — warn if PCI passthrough VMs exist
+    if [ -n "${PCI_PASSTHROUGH_VMS:-}" ] && [ -t 0 ]; then
+      echo ""
+      echo "=============================================="
+      echo "  WARNING: PCI PASSTHROUGH CONFLICT RISK"
+      echo "=============================================="
+      echo "  Enabling IOMMU will change PCI device group assignments."
+      echo "  Existing VMs with PCI passthrough may fail to start after reboot."
+      echo "  You may need to reconfigure hostpci settings for affected VMs."
+      echo ""
+      read -p "Proceed with IOMMU enablement? (y/N): " iommu_choice
+      if [[ "$iommu_choice" != [yY] ]]; then
+        log_and_exit "Setup cancelled: IOMMU enablement declined due to PCI passthrough conflict risk." "$logfile"
+      fi
+    fi
+    # Merge all required flags
     local new_cmdline="$current_cmdline"
     for flag in $grub_cmd; do
       if ! echo " $new_cmdline " | grep -qF " $flag "; then
@@ -559,7 +607,33 @@ setup_prerequisites() {
     grub_needs_update=true
     display_and_log "NOTICE: IOMMU has been enabled in GRUB. If you have existing PCI passthrough configurations, IOMMU group assignments may change after reboot." "$logfile"
   else
-    display_and_log "IOMMU already configured in GRUB, skipping GRUB command line modification." "$logfile"
+    # IOMMU already configured — still ensure framebuffer flags match user choice
+    local updated_cmdline="$current_cmdline"
+    if $disable_framebuffer; then
+      # Add framebuffer flags if missing
+      for flag in video=vesafb:off video=efifb:off; do
+        if ! echo " $updated_cmdline " | grep -qF " $flag "; then
+          updated_cmdline="$updated_cmdline $flag"
+        fi
+      done
+      local initcall_flag="initcall_blacklist=sysfb_init"
+      if pveversion | grep -qE "pve-manager/(7\.[2-9]|8\.|9\.)"; then
+        if ! echo " $updated_cmdline " | grep -qF " $initcall_flag "; then
+          updated_cmdline="$updated_cmdline $initcall_flag"
+        fi
+      fi
+    fi
+    updated_cmdline=$(echo "$updated_cmdline" | xargs)
+    if [ "$updated_cmdline" != "$(grep -oP 'GRUB_CMDLINE_LINUX_DEFAULT="\K[^"]*' /etc/default/grub 2>/dev/null)" ]; then
+      sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\"|GRUB_CMDLINE_LINUX_DEFAULT=\"$updated_cmdline\"|g" /etc/default/grub
+      grub_needs_update=true
+      if $disable_framebuffer; then
+        display_and_log "Added framebuffer disable flags to GRUB command line." "$logfile"
+      else
+        display_and_log "Removed framebuffer disable flags from GRUB command line." "$logfile"
+      fi
+    fi
+    display_and_log "IOMMU already configured in GRUB, skipping IOMMU command line modification." "$logfile"
   fi
   # Only add VFIO modules if not already present in /etc/modules
   local vfio_list=("vfio" "vfio_iommu_type1" "vfio_pci")
@@ -605,12 +679,50 @@ setup_prerequisites() {
   if ! grep -q "ignore_msrs=Y" /etc/modprobe.d/kvm.conf 2>/dev/null; then
     printf "options kvm ignore_msrs=Y report_ignored_msrs=0\n" > /etc/modprobe.d/kvm.conf
   fi
-  if [ -f /etc/modprobe.d/iommu_unsafe_interrupts.conf ] && ! grep -q "allow_unsafe_interrupts=1" /etc/modprobe.d/iommu_unsafe_interrupts.conf 2>/dev/null; then
-    cp /etc/modprobe.d/iommu_unsafe_interrupts.conf /etc/modprobe.d/iommu_unsafe_interrupts.conf.bak-osx-proxmox
-    display_and_log "Backed up existing /etc/modprobe.d/iommu_unsafe_interrupts.conf" "$logfile"
+  # VFIO unsafe interrupts is only needed on older chipsets without interrupt remapping
+  local enable_unsafe_interrupts=false
+  if [ -t 0 ]; then
+    echo ""
+    echo "VFIO unsafe interrupts allows PCI passthrough on systems without interrupt remapping."
+    echo "This is only needed on older chipsets and slightly weakens IOMMU isolation."
+    read -p "Enable VFIO unsafe interrupts? (y/N): " unsafe_choice
+    [[ "$unsafe_choice" == [yY] ]] && enable_unsafe_interrupts=true
   fi
-  if ! grep -q "allow_unsafe_interrupts=1" /etc/modprobe.d/iommu_unsafe_interrupts.conf 2>/dev/null; then
-    printf "options vfio_iommu_type1 allow_unsafe_interrupts=1\n" > /etc/modprobe.d/iommu_unsafe_interrupts.conf
+  local unsafe_conf="/etc/modprobe.d/iommu_unsafe_interrupts.conf"
+  if $enable_unsafe_interrupts; then
+    if ! grep -q "allow_unsafe_interrupts=1" "$unsafe_conf" 2>/dev/null; then
+      if [ -f "$unsafe_conf" ]; then
+        cp "$unsafe_conf" "${unsafe_conf}.bak-osx-proxmox"
+        display_and_log "Backed up existing $unsafe_conf" "$logfile"
+        if grep -q "^options vfio_iommu_type1" "$unsafe_conf" 2>/dev/null; then
+          # Append token to existing options line
+          sed -i 's/^options vfio_iommu_type1.*/& allow_unsafe_interrupts=1/' "$unsafe_conf"
+        else
+          # No existing vfio_iommu_type1 line — append a new one
+          printf "options vfio_iommu_type1 allow_unsafe_interrupts=1\n" >> "$unsafe_conf"
+        fi
+      else
+        printf "options vfio_iommu_type1 allow_unsafe_interrupts=1\n" > "$unsafe_conf"
+      fi
+      display_and_log "Enabled VFIO unsafe interrupts." "$logfile"
+    fi
+  else
+    # User declined — remove only the allow_unsafe_interrupts=1 token, preserving other options
+    if [ -f "$unsafe_conf" ] && grep -q "allow_unsafe_interrupts=1" "$unsafe_conf" 2>/dev/null; then
+      cp "$unsafe_conf" "${unsafe_conf}.bak-osx-proxmox"
+      display_and_log "Backed up existing $unsafe_conf" "$logfile"
+      # Remove the token and collapse extra whitespace
+      sed -i 's/ *allow_unsafe_interrupts=1//g' "$unsafe_conf"
+      # Remove any bare "options vfio_iommu_type1" lines with no remaining options
+      sed -i '/^options vfio_iommu_type1[[:space:]]*$/d' "$unsafe_conf"
+      # Remove the file if it's now empty
+      if [ ! -s "$unsafe_conf" ]; then
+        rm -f "$unsafe_conf"
+      fi
+      display_and_log "Disabled VFIO unsafe interrupts (removed allow_unsafe_interrupts=1)." "$logfile"
+    else
+      display_and_log "Skipping VFIO unsafe interrupts per user choice." "$logfile"
+    fi
   fi
   # Subscription nag removal is opt-in (also available via menu option 203)
   local patch_nag=false
