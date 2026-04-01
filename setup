@@ -70,11 +70,11 @@ for arg in "$@"; do
   esac
 done
 
-BACKUP_DIR=""
+BACKUP_DIR="${BACKUP_DIR:-/root/.osx-proxmox-backups}"
 
 # Create a backup of system configuration files before making changes
 create_system_backup() {
-  BACKUP_DIR="/root/OSX-PROXMOX/backups/$(date +%Y%m%d-%H%M%S)"
+  BACKUP_DIR="${BACKUP_DIR}/$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$BACKUP_DIR"
   [ -f /etc/default/grub ] && cp -a /etc/default/grub "$BACKUP_DIR/"
   [ -f /etc/modules ] && cp -a /etc/modules "$BACKUP_DIR/"
@@ -95,8 +95,8 @@ restore_system_backup() {
   echo "Restoring system configuration from: $backup"
   [ -f "$backup/grub" ] && cp -a "$backup/grub" /etc/default/grub && update-grub 2>/dev/null
   [ -f "$backup/modules" ] && cp -a "$backup/modules" /etc/modules
-  [ -d "$backup/modprobe.d" ] && cp -a "$backup/modprobe.d/"* /etc/modprobe.d/
-  [ -d "$backup/sources.list.d" ] && cp -a "$backup/sources.list.d/"* /etc/apt/sources.list.d/
+  [ -d "$backup/modprobe.d" ] && rsync -a --delete "$backup/modprobe.d/" /etc/modprobe.d/
+  [ -d "$backup/sources.list.d" ] && rsync -a --delete "$backup/sources.list.d/" /etc/apt/sources.list.d/
   [ -f "$backup/sources.list" ] && cp -a "$backup/sources.list" /etc/apt/sources.list
   [ -f "$backup/proxmoxlib.js" ] && cp -a "$backup/proxmoxlib.js" /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
   echo "Restore complete. A reboot may be required for kernel/GRUB changes to take effect."
@@ -199,6 +199,10 @@ preflight_check() {
       echo "Setup cancelled by user."
       exit 0
     fi
+  else
+    echo "Non-interactive shell detected — aborting setup."
+    echo "Run this script in an interactive terminal to proceed with prerequisites."
+    exit 1
   fi
 }
 
@@ -643,10 +647,10 @@ setup_prerequisites() {
     local running_vms=0
     local running_lxcs=0
     if command -v qm &>/dev/null; then
-      running_vms=$(qm list 2>/dev/null | grep -c "running" || echo 0)
+      running_vms=$(qm list 2>/dev/null | { grep -c "running" || true; })
     fi
     if command -v pct &>/dev/null; then
-      running_lxcs=$(pct list 2>/dev/null | grep -c "running" || echo 0)
+      running_lxcs=$(pct list 2>/dev/null | { grep -c "running" || true; })
     fi
     if [ "$running_vms" -gt 0 ] || [ "$running_lxcs" -gt 0 ]; then
       echo "=============================================="
@@ -1798,6 +1802,15 @@ for arg in "$@"; do
   fi
 done
 
+# In dry-run mode, run only the read-only preflight check and exit
+# before any side-effectful operations (dir creation, package installs, downloads)
+if $DRY_RUN; then
+  OSX_PLATFORM=$(detect_cpu_platform)
+  preflight_check
+  # preflight_check exits when DRY_RUN is true, but guard here too
+  exit 0
+fi
+
 clear
 init_dirs
 check_proxmox_version
@@ -1811,9 +1824,5 @@ OSX_PLATFORM=$(detect_cpu_platform)
 if [[ ! -e /etc/pve/qemu-server/.osx-proxmox ]]; then
   preflight_check
   setup_prerequisites
-fi
-if $DRY_RUN; then
-  echo "[DRY-RUN] Would proceed to main menu. Exiting."
-  exit 0
 fi
 main_menu
