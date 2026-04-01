@@ -33,7 +33,7 @@
 set -e
 
 # Constants
-SCRIPT_DIR="/root/OSX-PROXMOX"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOGDIR="${SCRIPT_DIR}/logs"
 MAIN_LOG="${LOGDIR}/main.log"
 TMPDIR="${SCRIPT_DIR}/tmp"
@@ -238,7 +238,13 @@ cleanup() {
     umount /mnt/opencore >>"$logfile" 2>&1 || display_and_log "Failed to unmount /mnt/opencore" "$logfile"
     rmdir /mnt/opencore 2>/dev/null
   fi
-  losetup -a | grep -q "$TMPDIR" && losetup -d $(losetup -j "$TMPDIR"/* | awk -F: '{print $1}') >>"$logfile" 2>&1
+  if losetup -a 2>/dev/null | grep -q "$TMPDIR"; then
+    local loop_devices
+    loop_devices=$(losetup -j "$TMPDIR"/* 2>/dev/null | awk -F: '{print $1}')
+    if [[ -n "$loop_devices" ]]; then
+      losetup -d $loop_devices >>"$logfile" 2>&1 || true
+    fi
+  fi
   rm -rf "${TMPDIR:?}"/* 2>/dev/null
 }
 trap cleanup EXIT
@@ -518,15 +524,19 @@ setup_prerequisites() {
     fi
   fi
   apt-get update >>"$logfile" 2>&1 || {
-    local country=$(curl -s https://ipinfo.io/country | tr '[:upper:]' '[:lower:]')
-    if [[ "$PVE_MAJOR" -ge 9 ]]; then
-      sed -i "s|ftp.$country.debian.org|ftp.debian.org|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
-    else
-      sed -i "s/ftp.$country.debian.org/ftp.debian.org/g" /etc/apt/sources.list
+    local country
+    country=$(curl -s -m 10 --connect-timeout 5 https://ipinfo.io/country 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    [[ "$country" =~ ^[a-z]{2}$ ]] || country=""
+    if [[ -n "$country" ]]; then
+      if [[ "$PVE_MAJOR" -ge 9 ]]; then
+        sed -i "s|ftp.$country.debian.org|ftp.debian.org|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+      else
+        sed -i "s/ftp.$country.debian.org/ftp.debian.org/g" /etc/apt/sources.list
+      fi
     fi
     apt-get update >>"$logfile" 2>&1 || log_and_exit "Failed to update apt" "$logfile"
   }
-  apt-get install -y vim unzip zip sysstat parted wget iptraf git htop ipcalc coreutils vim-common xmlstarlet >>"$logfile" 2>&1 || log_and_exit "Failed to install packages" "$logfile"
+  apt-get install -y vim unzip zip sysstat parted wget iptraf git htop ipcalc coreutils vim-common xmlstarlet python3 >>"$logfile" 2>&1 || log_and_exit "Failed to install packages" "$logfile"
   # Only change GRUB timeout if user confirms (cosmetic change)
   if [ -t 0 ]; then
     local current_timeout=$(grep -oP 'GRUB_TIMEOUT=\K[0-9]+' /etc/default/grub 2>/dev/null || echo "5")
@@ -800,31 +810,34 @@ setup_prerequisites() {
 # Function to download recovery image
 download_recovery_image() {
   local version_name=$1 board_id=$2 model_id=$3 iso_size=$4
-  local logfile="${LOGDIR}/crt-recovery-${version_name,,}.log"
-  local iso_path="${ISODIR}/recovery-${version_name,,}.iso"
+  local safe_name="${version_name// /-}"
+  local logfile="${LOGDIR}/crt-recovery-${safe_name,,}.log"
+  local iso_path="${ISODIR}/recovery-${safe_name,,}.iso"
 
   [[ -e "$iso_path" ]] && { display_and_log "Recovery image for $version_name exists" "$logfile"; return; }
   display_and_log "Creating recovery image for $version_name..." "$logfile"
-  fallocate -x -l "$iso_size" "${TMPDIR}/recovery-${version_name,,}.iso" >>"$logfile" 2>&1 || log_and_exit "Failed to allocate image" "$logfile"
-  mkfs.msdos -F 32 "${TMPDIR}/recovery-${version_name,,}.iso" -n "${version_name^^}" >>"$logfile" 2>&1 || log_and_exit "Failed to format image" "$logfile"
-  local loopdev=$(losetup -f --show "${TMPDIR}/recovery-${version_name,,}.iso") || log_and_exit "Failed to set up loop device" "$logfile"
+  fallocate -x -l "$iso_size" "${TMPDIR}/recovery-${safe_name,,}.iso" >>"$logfile" 2>&1 || log_and_exit "Failed to allocate image" "$logfile"
+  mkfs.msdos -F 32 "${TMPDIR}/recovery-${safe_name,,}.iso" -n "${version_name^^}" >>"$logfile" 2>&1 || log_and_exit "Failed to format image" "$logfile"
+  local loopdev
+  loopdev=$(losetup -f --show "${TMPDIR}/recovery-${safe_name,,}.iso") || log_and_exit "Failed to set up loop device" "$logfile"
   mkdir -p /mnt/APPLE >>"$logfile" 2>&1 || log_and_exit "Failed to create mount point" "$logfile"
   mount "$loopdev" /mnt/APPLE >>"$logfile" 2>&1 || log_and_exit "Failed to mount image" "$logfile"
-  cd /mnt/APPLE
+  cd /mnt/APPLE || log_and_exit "Failed to change directory to /mnt/APPLE" "$logfile"
   local recovery_args="-b $board_id -m $model_id download"
   [[ "$version_name" == "Sequoia" ]] && recovery_args="$recovery_args -os latest"
   python3 "${SCRIPT_DIR}/tools/macrecovery/macrecovery.py" $recovery_args >>"$logfile" 2>&1 || log_and_exit "Failed to download recovery" "$logfile"
   cd "$SCRIPT_DIR"
   umount /mnt/APPLE >>"$logfile" 2>&1 || log_and_exit "Failed to unmount image" "$logfile"
   losetup -d "$loopdev" >>"$logfile" 2>&1 || log_and_exit "Failed to detach loop device" "$logfile"
-  mv "${TMPDIR}/recovery-${version_name,,}.iso" "$iso_path" >>"$logfile" 2>&1 || log_and_exit "Failed to move image" "$logfile"
+  mv "${TMPDIR}/recovery-${safe_name,,}.iso" "$iso_path" >>"$logfile" 2>&1 || log_and_exit "Failed to move image" "$logfile"
   display_and_log "Recovery image created successfully" "$logfile"
 }
 
 # Function to create VM
 create_vm() {
   local iso_file version_name=$1 vm_id=$2 vm_name=$3 disk_size=$4 storage=$5 core_count=$6 ram_size=$7 iso_size=$8 disk_type=$9 bridge=${10}
-  local logfile="${LOGDIR}/crt-vm-${OSX_PLATFORM,,}-${version_name,,}.log"
+  local safe_name="${version_name// /-}"
+  local logfile="${LOGDIR}/crt-vm-${OSX_PLATFORM,,}-${safe_name,,}.log"
   iso_file="${OPENCORE_ISO}"
   if [ ! -f "${ISODIR}/$iso_file" ]; then
     update_opencore_iso
@@ -867,7 +880,7 @@ create_vm() {
     --vga vmware --vmgenid 1 --scsihw virtio-scsi-pci \
     --"$disk_type" "${storage}:${disk_size},cache=none,discard=on" \
     --ide0 "${storage_iso}:iso/${iso_file},media=cdrom,cache=unsafe,size=96M" \
-    --ide2 "${storage_iso}:iso/recovery-${version_name,,}.iso,media=cdrom,cache=unsafe,size=${iso_size}" >>"$logfile" 2>&1 || log_and_exit "Failed to create VM" "$logfile"
+    --ide2 "${storage_iso}:iso/recovery-${safe_name,,}.iso,media=cdrom,cache=unsafe,size=${iso_size}" >>"$logfile" 2>&1 || log_and_exit "Failed to create VM" "$logfile"
   sed -i 's/media=cdrom/media=disk/' "/etc/pve/qemu-server/$vm_id.conf" >>"$logfile" 2>&1 || log_and_exit "Failed to update VM config" "$logfile"
 
   display_and_log "VM ($vm_name) created successfully" "$logfile"
@@ -914,6 +927,7 @@ update_opencore_smbios() {
         if [ -n "$new_value" ] && [ "$new_value" != "$SystemProductName" ]; then
           SystemProductName="$new_value"
         fi
+      [[ -f "$SCRIPT_DIR/tools/GenSMBIOS/GenSMBIOS.py" ]] || log_and_exit "GenSMBIOS not found. Run: git submodule update --init" "$logfile"
       python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --install
       python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --generate "$SystemProductName" -j "$oc_json_path" >>"$logfile" 2>&1 || log_and_exit "Failed to generate SMBIOS" "$logfile"
     else
@@ -922,7 +936,8 @@ update_opencore_smbios() {
     fi
   fi
 
-  local loopdev=$(losetup -f --show -P "$iso_path") || log_and_exit "Failed to set up loop device" "$logfile"
+  local loopdev
+  loopdev=$(losetup -f --show -P "$iso_path") || log_and_exit "Failed to set up loop device" "$logfile"
   mkdir -p /mnt/opencore >>"$logfile" 2>&1 || log_and_exit "Failed to create mount point" "$logfile"
   mount "${loopdev}p1" /mnt/opencore >>"$logfile" 2>&1 || log_and_exit "Failed to mount ISO" "$logfile"
   local config="/mnt/opencore/EFI/OC/config.plist"
@@ -1027,7 +1042,8 @@ customize_opencore_config() {
   ensure_base64_xxd_dependency "$logfile"
   ensure_jq_dependency
 
-  local loopdev=$(losetup -f --show -P "$iso") || log_and_exit "Failed to set up loop device" "$logfile"
+  local loopdev
+  loopdev=$(losetup -f --show -P "$iso") || log_and_exit "Failed to set up loop device" "$logfile"
   mkdir -p /mnt/opencore >>"$logfile" 2>&1 || log_and_exit "Failed to create mount point" "$logfile"
   mount "${loopdev}p1" /mnt/opencore >>"$logfile" 2>&1 || log_and_exit "Failed to mount ISO" "$logfile"
   local config="/mnt/opencore/EFI/OC/config.plist"
@@ -1108,6 +1124,7 @@ customize_opencore_config() {
       if [ -n "$new_value" ] && [ "$new_value" != "$SystemProductName" ]; then
         SystemProductName="$new_value"
       fi
+    [[ -f "$SCRIPT_DIR/tools/GenSMBIOS/GenSMBIOS.py" ]] || log_and_exit "GenSMBIOS not found. Run: git submodule update --init" "$logfile"
     python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --install
     python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --generate "$SystemProductName" -j "$oc_json_path" >>"$logfile" 2>&1 || log_and_exit "Failed to generate SMBIOS" "$logfile"
     # Apply new JSON
@@ -1426,7 +1443,9 @@ configure_network_bridge() {
 
     # Calculate DHCP range (skip first 50 IPs)
     IFS='.' read -r i1 i2 i3 i4 <<< "${network_info[hostmin]}"
-    network_info["range_start"]="$i1.$i2.$i3.$((i4 + 50))"
+    local start_octet=$((i4 + 50))
+    ((start_octet > 254)) && start_octet=254
+    network_info["range_start"]="$i1.$i2.$i3.$start_octet"
     network_info["range_end"]="${network_info[hostmax]}"
     network_info["gateway"]="${network_info[network]%.*}.1"
 

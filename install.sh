@@ -10,6 +10,7 @@
 
 # Exit on any error
 set -e
+set -o pipefail
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
@@ -89,8 +90,12 @@ check_status "Failed to clone repository"
 if [ -f "/root/OSX-PROXMOX/setup" ]; then
     chmod +x "/root/OSX-PROXMOX/setup"
     log_message "Running setup script..."
-    /root/OSX-PROXMOX/setup 2>&1 | tee -a "$LOG_FILE" 
-    check_status "Failed to run setup script"
+    /root/OSX-PROXMOX/setup 2>&1 | tee -a "$LOG_FILE"
+    setup_exit=${PIPESTATUS[0]}
+    if [ "$setup_exit" -ne 0 ]; then
+        log_message "Error: Failed to run setup script (exit code: $setup_exit)"
+        exit 1
+    fi
 else
     log_message "Error: Setup script not found in /root/OSX-PROXMOX"
     exit 1

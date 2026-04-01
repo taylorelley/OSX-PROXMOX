@@ -5,3 +5,4 @@
 ehthumbs.db
 Thumbs.db
 logs
+__pycache__/
