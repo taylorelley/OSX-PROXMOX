@@ -18,6 +18,14 @@ if [ "$EUID" -ne 0 ]; then
 	exit 1
 fi
 
+# When invoked via `curl … | bash`, stdin is the curl pipe (EOF), which
+# makes every `read` prompt return empty and silently accept defaults —
+# including the main-menu exit. If a controlling terminal is available,
+# reattach stdin to it so the prompts in this script and in ./setup work.
+if [ ! -t 0 ] && [ -r /dev/tty ]; then
+    exec < /dev/tty
+fi
+
 # Define log file
 LOG_FILE="/root/install-osx-proxmox.log"
 
