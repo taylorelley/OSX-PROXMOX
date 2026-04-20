@@ -39,6 +39,9 @@ clear
 
 # Clean up existing files
 log_message "Cleaning up existing files..."
+# cd away first so we don't delete our own CWD when the user ran this script
+# from inside a pre-existing /root/OSX-PROXMOX clone.
+cd /root
 [ -d "/root/OSX-PROXMOX" ] && rm -rf "/root/OSX-PROXMOX"
 
 # Ask before disabling enterprise/ceph repo files (may be needed for subscribed installations)
