@@ -47,6 +47,7 @@ sudo spctl --master-disable
 ✅ macOS Ventura - 13  
 ✅ macOS Sonoma - 14  
 ✅ macOS Sequoia - 15  
+✅ macOS Tahoe - 26  
 
 ---
 
