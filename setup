@@ -942,7 +942,7 @@ create_vm() {
     if $is_modern; then
       case "$amd_profile" in
         conservative)
-          cpu_args="-cpu Haswell-noTSX-IBRS,vendor=GenuineIntel,kvm=on,+hypervisor,+kvm_pv_unhalt,+kvm_pv_eoi,+invtsc,+ssse3,+sse4.1,+sse4.2,+popcnt,+aes,+xsave,+xsaveopt,+avx,+avx2,+fma,+bmi1,+bmi2,+f16c,+movbe,+pdpe1gb,+rdrand,+rdseed,-mpx,-pku,-ospke,-clwb,-clflushopt,-pcid,-hle,-rtm,check"
+          cpu_args="-cpu Haswell-noTSX-IBRS,vendor=GenuineIntel,kvm=on,+hypervisor,+kvm_pv_unhalt,+kvm_pv_eoi,+invtsc,+ssse3,+sse4.1,+sse4.2,+popcnt,+aes,+xsave,+xsaveopt,+avx,+avx2,+fma,+bmi1,+bmi2,+f16c,+movbe,+pdpe1gb,+rdrand,+rdseed,-pcid,-hle,-rtm,check"
           ;;
         aggressive)
           cpu_args="-cpu Cascadelake-Server,vendor=GenuineIntel,kvm=on,+hypervisor,+kvm_pv_unhalt,+kvm_pv_eoi,+invtsc,+ssse3,+sse4.2,+popcnt,+aes,+xsave,+xsaveopt,+avx,+avx2,+fma,+bmi1,+bmi2,+f16c,+rdrand,+rdseed,-pcid,-hle,-rtm,-mpx,-pku,-ospke,-clwb,-clflushopt,-avx512f,-avx512dq,-avx512cd,-avx512bw,-avx512vl,-avx512vnni"
