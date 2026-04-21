@@ -142,6 +142,56 @@ In some environments it is necessary to segment the IOMMU Groups to be able to p
 1. Add the content `pcie_acs_override=downstream,multifunction pci=nommconf` in the file `/etc/default/grub` at the end of the line `GRUB_CMDLINE_LINUX_DEFAULT`;
 2. After changing the grub file, run the command `update-grub` and reboot your PVE.
 
+### ❌ AMD CPU profiles
+
+When creating any macOS VM on an AMD host, `setup` detects your Ryzen generation from `/proc/cpuinfo` flags and prompts you to pick a CPU profile. Pressing Enter accepts the recommended default — which for Ventura, Sonoma, Sequoia, and all pre-Ventura macOS releases is `baseline`, i.e. the same `-cpu` string the script used before this change (no behaviour change unless you explicitly pick a different profile).
+
+For Tahoe (macOS 26) the recommended default depends on Ryzen generation:
+
+| Zen gen        | Recommended profile | Rationale |
+|----------------|---------------------|-----------|
+| Zen 1 / Zen+   | `conservative`      | PKU/CLWB/CLFLUSHOPT absent; soft TSC sync |
+| Zen 2          | `conservative`      | CLWB still absent; TSC sync variable |
+| Zen 3          | `aggressive`        | Cascadelake-compatible feature set |
+| Zen 4 / Zen 5  | `aggressive`        | Full modern feature set |
+
+#### Profile definitions
+
+Available profiles for Ventura and newer:
+
+| Profile        | Base CPU model                         | Notes |
+|----------------|----------------------------------------|-------|
+| `conservative` | Haswell-noTSX-IBRS, strict negation    | Narrow feature set, safest on older Ryzens |
+| `aggressive`   | Cascadelake-Server + positive flags    | No vmware-cpuid-freq |
+| `baseline`     | Cascadelake-Server + vmware-cpuid-freq | Pre-2026.04 behaviour |
+| `host`         | host pass-through, vendor spoofed      | Diagnostic only |
+
+Available profiles for pre-Ventura macOS:
+
+| Profile    | Base CPU model                    | Notes |
+|------------|-----------------------------------|-------|
+| `baseline` | Penryn                            | Current stable behaviour |
+| `host`     | host pass-through, vendor spoofed | Diagnostic only |
+
+#### Overriding the profile non-interactively
+
+```bash
+OSX_AMD_CPU_PROFILE=conservative ./setup
+OSX_AMD_CPU_PROFILE=aggressive   ./setup
+OSX_AMD_CPU_PROFILE=baseline     ./setup
+OSX_AMD_CPU_PROFILE=host         ./setup
+```
+
+The chosen profile, detected Zen generation, and recommended default are logged to the per-VM log (`crt-vm-amd-<osname>.log`).
+
+#### If every profile still freezes at the Apple logo
+
+The bundled OpenCore EFI (`EFI/opencore-osx-proxmox-vm.iso`) ships pre-built and may be missing AMD vanilla kernel patches matching your target Darwin version. This script cannot regenerate the EFI. Rebuild it from [AMD-OSX/AMD_Vanilla](https://github.com/AMD-OSX/AMD_Vanilla) against the appropriate Darwin kernel and replace `EFI/opencore-osx-proxmox-vm.iso` with the result.
+
+#### Diagnostic data is auto-captured
+
+Every VM creation appends the VM config, `lscpu`, `dmesg | grep clocksource`, `kvm_amd` module parameters, and QEMU version to the per-VM log. Attach that log when filing an issue.
+
 ---
 
 ## 🎥 Demonstration (in Portuguese)

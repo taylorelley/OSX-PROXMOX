@@ -834,6 +834,39 @@ download_recovery_image() {
   display_and_log "Recovery image created successfully" "$logfile"
 }
 
+# Classify the host AMD generation by CPU feature flags.
+# Echoes one of: zen1 | zen2 | zen3 | zen4plus | unknown
+detect_amd_zen_gen() {
+  local flags
+  flags=$(awk -F': ' '/^flags/ {print $2; exit}' /proc/cpuinfo 2>/dev/null)
+  [[ -z "$flags" ]] && { echo "unknown"; return; }
+  if [[ " $flags " == *" avx512f "* ]]; then
+    echo "zen4plus"
+  elif [[ " $flags " == *" clwb "* ]]; then
+    echo "zen3"
+  elif [[ " $flags " == *" clflushopt "* ]]; then
+    echo "zen2"
+  else
+    echo "zen1"
+  fi
+}
+
+# Map (Zen gen, macOS version) -> recommended CPU profile name.
+recommend_amd_cpu_profile() {
+  local zen_gen="$1" os_name="$2"
+  case "$os_name" in
+    Tahoe)
+      case "$zen_gen" in
+        zen1|zen2)     echo "conservative" ;;
+        zen3|zen4plus) echo "aggressive"   ;;
+        *)             echo "conservative" ;;
+      esac
+      ;;
+    Ventura|Sonoma|Sequoia) echo "baseline" ;;
+    *)                      echo "baseline" ;;
+  esac
+}
+
 # Function to create VM
 create_vm() {
   local iso_file version_name=$1 vm_id=$2 vm_name=$3 disk_size=$4 storage=$5 core_count=$6 ram_size=$7 iso_size=$8 disk_type=$9 bridge=${10}
@@ -852,10 +885,90 @@ create_vm() {
     device_args="$device_args -device usb-kbd,bus=ehci.0,port=2 -device usb-mouse,bus=ehci.0,port=3"
   fi
   if [[ "$OSX_PLATFORM" == "AMD" ]]; then
-    if [[ "$version_name" =~ ^(Ventura|Sonoma|Sequoia|Tahoe)$ ]]; then
-      cpu_args="-cpu Cascadelake-Server,vendor=GenuineIntel,+hypervisor,+kvm_pv_unhalt,+kvm_pv_eoi,+invtsc,-pcid,-hle,-rtm,-avx512f,-avx512dq,-avx512cd,-avx512bw,-avx512vl,-avx512vnni,kvm=on,vmware-cpuid-freq=on"
+    local is_modern=false
+    [[ "$version_name" =~ ^(Ventura|Sonoma|Sequoia|Tahoe)$ ]] && is_modern=true
+
+    local zen_gen recommended amd_profile
+    zen_gen=$(detect_amd_zen_gen)
+    recommended=$(recommend_amd_cpu_profile "$zen_gen" "$version_name")
+
+    if [[ -n "${OSX_AMD_CPU_PROFILE:-}" ]]; then
+      amd_profile="$OSX_AMD_CPU_PROFILE"
+      display_and_log "AMD CPU profile from OSX_AMD_CPU_PROFILE: $amd_profile (OS: $version_name, detected: $zen_gen)" "$logfile"
+    elif [ -t 0 ]; then
+      echo ""
+      echo "AMD host detected as Zen generation: $zen_gen"
+      echo "macOS target: $version_name"
+      echo "Recommended CPU profile: $recommended"
+      echo ""
+      if $is_modern; then
+        echo "  1) conservative  Haswell-noTSX-IBRS, strict negation, no vmware-cpuid-freq   [best for Zen 1/2]"
+        echo "  2) aggressive    Cascadelake-Server + positive flags, no vmware-cpuid-freq   [best for Zen 3+]"
+        echo "  3) baseline      Cascadelake-Server + vmware-cpuid-freq=on                   [pre-2026.04 default]"
+        echo "  4) host          host pass-through with vendor spoof                         [diagnostic]"
+      else
+        echo "  3) baseline      Penryn + paravirt + explicit SSE/AVX flags                  [current default]"
+        echo "  4) host          host pass-through with vendor spoof                         [diagnostic]"
+        echo "  (conservative/aggressive are only defined for Ventura and newer)"
+      fi
+      echo ""
+      local pick_default pick_choice
+      case "$recommended" in
+        conservative) pick_default=1 ;;
+        aggressive)   pick_default=2 ;;
+        baseline)     pick_default=3 ;;
+        host)         pick_default=4 ;;
+        *)            pick_default=3 ;;
+      esac
+      read -p "Select profile [1-4] (default ${pick_default} = ${recommended}): " pick_choice
+      [[ -z "$pick_choice" ]] && pick_choice="$pick_default"
+      case "$pick_choice" in
+        1) amd_profile="conservative" ;;
+        2) amd_profile="aggressive"   ;;
+        3) amd_profile="baseline"     ;;
+        4) amd_profile="host"         ;;
+        *) log_and_exit "Invalid profile choice: $pick_choice" "$logfile" ;;
+      esac
+      if ! $is_modern && [[ "$amd_profile" =~ ^(conservative|aggressive)$ ]]; then
+        display_and_log "Profile '$amd_profile' is not defined for $version_name; falling back to 'baseline'." "$logfile"
+        amd_profile="baseline"
+      fi
+      display_and_log "AMD CPU profile: $amd_profile (OS: $version_name, detected: $zen_gen, recommended: $recommended)" "$logfile"
     else
-      cpu_args="-cpu Penryn,kvm=on,vendor=GenuineIntel,+kvm_pv_unhalt,+kvm_pv_eoi,+hypervisor,+invtsc,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+fma,+bmi1,+bmi2,+xsave,+xsaveopt,check"
+      amd_profile="$recommended"
+      display_and_log "AMD CPU profile (non-interactive): $amd_profile (OS: $version_name, detected: $zen_gen)" "$logfile"
+    fi
+
+    if $is_modern; then
+      case "$amd_profile" in
+        conservative)
+          cpu_args="-cpu Haswell-noTSX-IBRS,vendor=GenuineIntel,kvm=on,+hypervisor,+kvm_pv_unhalt,+kvm_pv_eoi,+invtsc,+ssse3,+sse4.1,+sse4.2,+popcnt,+aes,+xsave,+xsaveopt,+avx,+avx2,+fma,+bmi1,+bmi2,+f16c,+movbe,+pdpe1gb,+rdrand,+rdseed,-mpx,-pku,-ospke,-clwb,-clflushopt,-pcid,-hle,-rtm,check"
+          ;;
+        aggressive)
+          cpu_args="-cpu Cascadelake-Server,vendor=GenuineIntel,kvm=on,+hypervisor,+kvm_pv_unhalt,+kvm_pv_eoi,+invtsc,+ssse3,+sse4.2,+popcnt,+aes,+xsave,+xsaveopt,+avx,+avx2,+fma,+bmi1,+bmi2,+f16c,+rdrand,+rdseed,-pcid,-hle,-rtm,-mpx,-pku,-ospke,-clwb,-clflushopt,-avx512f,-avx512dq,-avx512cd,-avx512bw,-avx512vl,-avx512vnni"
+          ;;
+        baseline)
+          cpu_args="-cpu Cascadelake-Server,vendor=GenuineIntel,+hypervisor,+kvm_pv_unhalt,+kvm_pv_eoi,+invtsc,-pcid,-hle,-rtm,-avx512f,-avx512dq,-avx512cd,-avx512bw,-avx512vl,-avx512vnni,kvm=on,vmware-cpuid-freq=on"
+          ;;
+        host)
+          cpu_args="-cpu host,kvm=on,vendor=GenuineIntel,+hypervisor,+kvm_pv_unhalt,+kvm_pv_eoi,+invtsc,check"
+          ;;
+        *)
+          log_and_exit "Unknown AMD CPU profile: $amd_profile" "$logfile"
+          ;;
+      esac
+    else
+      case "$amd_profile" in
+        baseline)
+          cpu_args="-cpu Penryn,kvm=on,vendor=GenuineIntel,+kvm_pv_unhalt,+kvm_pv_eoi,+hypervisor,+invtsc,+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+fma,+bmi1,+bmi2,+xsave,+xsaveopt,check"
+          ;;
+        host)
+          cpu_args="-cpu host,kvm=on,vendor=GenuineIntel,+hypervisor,+kvm_pv_unhalt,+kvm_pv_eoi,+invtsc,check"
+          ;;
+        *)
+          log_and_exit "Unknown AMD CPU profile for $version_name: $amd_profile" "$logfile"
+          ;;
+      esac
     fi
   else
     cpu_args="-cpu host,kvm=on,vendor=GenuineIntel,+kvm_pv_unhalt,+kvm_pv_eoi,+hypervisor,+invtsc"
@@ -883,6 +996,21 @@ create_vm() {
     --ide0 "${storage_iso}:iso/${iso_file},media=cdrom,cache=unsafe,size=96M" \
     --ide2 "${storage_iso}:iso/recovery-${safe_name,,}.iso,media=cdrom,cache=unsafe,size=${iso_size}" >>"$logfile" 2>&1 || log_and_exit "Failed to create VM" "$logfile"
   sed -i 's/media=cdrom/media=disk/' "/etc/pve/qemu-server/$vm_id.conf" >>"$logfile" 2>&1 || log_and_exit "Failed to update VM config" "$logfile"
+
+  {
+    echo "===== VM CONFIG (${vm_id}) ====="
+    cat "/etc/pve/qemu-server/${vm_id}.conf" 2>/dev/null
+    echo "===== HOST lscpu (head) ====="
+    lscpu 2>/dev/null | head -40
+    echo "===== HOST clocksource / TSC ====="
+    dmesg 2>/dev/null | grep -iE 'tsc|clocksource' | head -20
+    echo "===== HOST kvm_amd module parameters ====="
+    for p in /sys/module/kvm_amd/parameters/*; do
+      [ -r "$p" ] && printf '%s = %s\n' "${p##*/}" "$(cat "$p" 2>/dev/null)"
+    done
+    echo "===== qemu-system-x86_64 version ====="
+    qemu-system-x86_64 --version 2>/dev/null | head -2
+  } >>"$logfile" 2>&1
 
   display_and_log "VM ($vm_name) created successfully" "$logfile"
   local bridge_ip=$(ip -4 addr show "$bridge" | awk '/inet/ {print $2}' | cut -d'/' -f1 || echo "unknown")
