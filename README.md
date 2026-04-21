@@ -49,13 +49,22 @@ sudo spctl --master-disable
 ✅ macOS Sequoia - 15  
 ✅ macOS Tahoe - 26  
 
+> **macOS Tahoe (26) notes.** The shipped OpenCore ISO defaults to the
+> `iMac20,1` SMBIOS, which is on Apple's Tahoe allow-list. Clean installs
+> work out of the box. Items from the Dortania Tahoe guide that are
+> **bare-metal only** (analog audio via AppleHDA/AppleALC, AMD dGPU connector
+> patching in WhateverGreen, Broadcom Wi-Fi, Intel Bluetooth) do not apply
+> to QEMU VMs. If you want OTA system updates on Tahoe, you must add
+> `RestrictEvents.kext` to your EFI and set `boot-args += revpatch=sbvmm` —
+> this is outside the default ISO to keep the VM footprint minimal.
+
 ---
 
 ## 🖥 Proxmox VE Versions Supported
 ✅ v7.0.XX ~ 9.1.XX
 
 ### 🔄 OpenCore Version
-- **April/2025 - 1.0.4** → with SIP Enabled, DMG only signed by Apple and all features of securities
+- **April/2026 - 1.0.7** → Tahoe-capable kext injection (≥ 1.0.5) and XhciPortLimit fixes; ships Lilu 1.7.2, VirtualSMC 1.3.7, WhateverGreen 1.7.0. SIP enabled, DMG signed by Apple. Rebuild locally with `sudo tools/build-opencore-iso.sh`.
 
 ---
 
