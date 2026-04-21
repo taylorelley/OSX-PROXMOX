@@ -4,6 +4,21 @@ OpenCore Changelog
 #### Latest versions
 - Check history of commits
 
+#### 2026.04.21 – Tahoe refresh
+
+- Rebuilt `EFI/opencore-osx-proxmox-vm.iso` with OpenCore **1.0.7** (first OC
+  release with Tahoe `XhciPortLimit` + kext-injection fixes documented in
+  Dortania's macOS 26 guide).
+- Bumped bundled Acidanthera kexts: Lilu **1.7.2**, VirtualSMC **1.3.7**,
+  WhateverGreen **1.7.0**. `AppleMCEReporterDisabler.kext` is preserved as-is.
+- Normalised shipped `config.plist` to `SecureBootModel = Disabled`, which is
+  the Dortania-recommended setting for Tahoe VM installs.
+- Added `tools/build-opencore-iso.sh` — a reproducible, mtools-based builder
+  that downloads pinned OpenCore + kext releases, stages the EFI tree,
+  stamps a 96 MiB MBR/FAT32 image and replaces the shipped ISO in place.
+  Users can re-run it at any time to pick up newer releases.
+- `OCVERSION` in `setup` is now `1.0.7` and `HACKPXVERSION` = `2026.04.21`.
+
 #### v3.2.0
 
 - Open SOURCE CODE of BINARY \o/
