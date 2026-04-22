@@ -537,7 +537,7 @@ setup_prerequisites() {
     fi
     apt-get update >>"$logfile" 2>&1 || log_and_exit "Failed to update apt" "$logfile"
   }
-  apt-get install -y vim unzip zip sysstat parted wget iptraf git htop ipcalc coreutils vim-common xmlstarlet python3 >>"$logfile" 2>&1 || log_and_exit "Failed to install packages" "$logfile"
+  apt-get install -y vim unzip zip sysstat parted wget iptraf git htop ipcalc coreutils vim-common xmlstarlet python3 p7zip-full mtools >>"$logfile" 2>&1 || log_and_exit "Failed to install packages" "$logfile"
   # Only change GRUB timeout if user confirms (cosmetic change)
   if [ -t 0 ]; then
     local current_timeout=$(grep -oP 'GRUB_TIMEOUT=\K[0-9]+' /etc/default/grub 2>/dev/null || echo "5")
@@ -867,6 +867,152 @@ recommend_amd_cpu_profile() {
   esac
 }
 
+# Extract AppleVirtIO.kext from the user's downloaded recovery image and
+# inject it into the shared OpenCore ISO so the Catalina installer sees
+# virtio0 disks. Idempotent: a second call short-circuits once the kext is
+# already registered in config.plist. Any failure returns 0 so VM creation
+# is not blocked; injection is best-effort.
+inject_applevirtio_kext() {
+  local recovery_iso="$1" opencore_iso="$2" logfile="$3"
+  local workdir="" loopdev="" mnt_dir="" rc=0
+
+  [[ -f "$recovery_iso" && -f "$opencore_iso" ]] || return 0
+  command -v 7z    >/dev/null 2>&1 || { display_and_log "7z not installed; skipping AppleVirtIO.kext injection" "$logfile"; return 0; }
+  command -v mcopy >/dev/null 2>&1 || { display_and_log "mtools not installed; skipping AppleVirtIO.kext injection" "$logfile"; return 0; }
+
+  workdir=$(mktemp -d)
+  trap '
+    [[ -n "$mnt_dir" ]] && mountpoint -q "$mnt_dir" && umount "$mnt_dir" >/dev/null 2>&1
+    [[ -n "$loopdev" ]] && losetup -d "$loopdev" >/dev/null 2>&1
+    [[ -n "$workdir" ]] && rm -rf "$workdir"
+    trap - RETURN
+  ' RETURN
+
+  local mtoolsrc="$workdir/mtoolsrc" plist="$workdir/config.plist"
+  cat >"$mtoolsrc" <<EOF
+drive a: file="$opencore_iso" offset=512
+EOF
+
+  # 1. Idempotency guard: pull config.plist out of the ISO and short-circuit
+  #    if AppleVirtIO.kext is already registered.
+  if ! MTOOLSRC="$mtoolsrc" MTOOLS_SKIP_CHECK=1 mcopy -n "a:/EFI/OC/config.plist" "$plist" >>"$logfile" 2>&1; then
+    display_and_log "Failed to read config.plist from OpenCore ISO; skipping AppleVirtIO.kext injection" "$logfile"
+    return 0
+  fi
+  if grep -q 'AppleVirtIO.kext' "$plist" 2>/dev/null; then
+    display_and_log "AppleVirtIO.kext already registered in OpenCore config.plist; skipping injection" "$logfile"
+    return 0
+  fi
+
+  # 2. Loop-mount the recovery FAT32 to reach BaseSystem.dmg.
+  mnt_dir="$workdir/recovery"
+  mkdir -p "$mnt_dir"
+  loopdev=$(losetup -f --show "$recovery_iso" 2>>"$logfile") || {
+    display_and_log "Failed to loop-mount $recovery_iso; skipping AppleVirtIO.kext injection" "$logfile"
+    return 0
+  }
+  if ! mount -o ro "$loopdev" "$mnt_dir" >>"$logfile" 2>&1; then
+    display_and_log "Failed to mount recovery image; skipping AppleVirtIO.kext injection" "$logfile"
+    return 0
+  fi
+  local basesystem
+  basesystem=$(find "$mnt_dir" -maxdepth 3 -type f -iname 'BaseSystem.dmg' 2>/dev/null | head -n 1)
+  if [[ -z "$basesystem" ]]; then
+    display_and_log "BaseSystem.dmg not found in recovery image; skipping AppleVirtIO.kext injection" "$logfile"
+    return 0
+  fi
+
+  # 3. Extract AppleVirtIO.kext from the DMG. 7z can usually unpack a DMG's
+  #    inner HFS+/APFS volume in one pass with a wildcard filter; if that
+  #    misses (some 7z builds need the volume extracted first), fall back to
+  #    extracting the raw volume and then the kext from it.
+  display_and_log "Extracting AppleVirtIO.kext from BaseSystem.dmg..." "$logfile"
+  local stage1="$workdir/dmg1"; mkdir -p "$stage1"
+  7z x -y -o"$stage1" "$basesystem" '*AppleVirtIO.kext*' -r >>"$logfile" 2>&1 || true
+  local kext_src
+  kext_src=$(find "$stage1" -type d -name 'AppleVirtIO.kext' 2>/dev/null | head -n 1)
+  if [[ -z "$kext_src" ]]; then
+    local stage2="$workdir/dmg2"; mkdir -p "$stage2"
+    7z x -y -o"$stage2" "$basesystem" >>"$logfile" 2>&1 || true
+    local inner_vol
+    inner_vol=$(find "$stage2" -maxdepth 3 -type f \( -iname '*.hfs' -o -iname '*.hfsx' -o -iname '*.img' \) 2>/dev/null | head -n 1)
+    if [[ -z "$inner_vol" ]]; then
+      inner_vol=$(find "$stage2" -maxdepth 3 -type f -printf '%s %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)
+    fi
+    if [[ -n "$inner_vol" && -f "$inner_vol" ]]; then
+      local stage3="$workdir/dmg3"; mkdir -p "$stage3"
+      7z x -y -o"$stage3" "$inner_vol" '*AppleVirtIO.kext*' -r >>"$logfile" 2>&1 || true
+      kext_src=$(find "$stage3" -type d -name 'AppleVirtIO.kext' 2>/dev/null | head -n 1)
+    fi
+  fi
+  if [[ -z "$kext_src" || ! -f "$kext_src/Contents/MacOS/AppleVirtIO" ]]; then
+    display_and_log "Could not extract a valid AppleVirtIO.kext from recovery image; skipping injection" "$logfile"
+    return 0
+  fi
+
+  # Locate the storage plugin inside the umbrella kext, if present.
+  local plugin_src plugin_name=""
+  plugin_src=$(find "$kext_src/Contents/PlugIns" -maxdepth 1 -type d -iname '*Storage*.kext' 2>/dev/null | head -n 1)
+  if [[ -n "$plugin_src" ]]; then
+    local candidate="$(basename "$plugin_src" .kext)"
+    [[ -f "$plugin_src/Contents/MacOS/$candidate" ]] && plugin_name="$candidate"
+  fi
+
+  # 4. Copy the kext into the ISO at EFI/OC/Kexts/AppleVirtIO.kext.
+  if ! MTOOLSRC="$mtoolsrc" MTOOLS_SKIP_CHECK=1 mcopy -s -n "$kext_src" "a:/EFI/OC/Kexts/" >>"$logfile" 2>&1; then
+    display_and_log "Failed to write AppleVirtIO.kext into OpenCore ISO; skipping injection" "$logfile"
+    return 0
+  fi
+
+  # 5. Append Kernel > Add entries to config.plist and write it back.
+  if ! python3 - "$plist" "$plugin_name" >>"$logfile" 2>&1 <<'PYEOF'
+import plistlib, sys
+path, plugin = sys.argv[1], sys.argv[2]
+with open(path, 'rb') as f:
+    cfg = plistlib.load(f)
+add = cfg.setdefault('Kernel', {}).setdefault('Add', [])
+have = {e.get('BundlePath') for e in add if isinstance(e, dict)}
+entries = [{
+    'Arch': 'Any',
+    'BundlePath': 'AppleVirtIO.kext',
+    'Comment': 'virtio-blk support for macOS guests (Catalina+)',
+    'Enabled': True,
+    'ExecutablePath': 'Contents/MacOS/AppleVirtIO',
+    'MaxKernel': '',
+    'MinKernel': '19.0.0',
+    'PlistPath': 'Contents/Info.plist',
+}]
+if plugin:
+    entries.append({
+        'Arch': 'Any',
+        'BundlePath': 'AppleVirtIO.kext/Contents/PlugIns/%s.kext' % plugin,
+        'Comment': 'virtio-blk storage plugin',
+        'Enabled': True,
+        'ExecutablePath': 'Contents/MacOS/%s' % plugin,
+        'MaxKernel': '',
+        'MinKernel': '19.0.0',
+        'PlistPath': 'Contents/Info.plist',
+    })
+for e in entries:
+    if e['BundlePath'] not in have:
+        add.append(e)
+with open(path, 'wb') as f:
+    plistlib.dump(cfg, f)
+PYEOF
+  then
+    display_and_log "Failed to patch config.plist for AppleVirtIO.kext; skipping injection" "$logfile"
+    return 0
+  fi
+
+  if ! MTOOLSRC="$mtoolsrc" MTOOLS_SKIP_CHECK=1 mcopy -o "$plist" "a:/EFI/OC/config.plist" >>"$logfile" 2>&1; then
+    display_and_log "Failed to write patched config.plist back to OpenCore ISO" "$logfile"
+    return 0
+  fi
+
+  display_and_log "Injected AppleVirtIO.kext${plugin_name:+ + $plugin_name.kext plugin} into OpenCore ISO" "$logfile"
+  return 0
+}
+
 # Function to create VM
 create_vm() {
   local iso_file version_name=$1 vm_id=$2 vm_name=$3 disk_size=$4 storage=$5 core_count=$6 ram_size=$7 iso_size=$8 disk_type=$9 bridge=${10}
@@ -877,6 +1023,15 @@ create_vm() {
     update_opencore_iso
   fi
   [[ ! -d "/sys/class/net/$bridge" ]] && log_and_exit "Bridge $bridge does not exist" "$logfile"
+
+  # Inject AppleVirtIO.kext so macOS Catalina (and newer) can see virtio0
+  # disks. Extracted from this user's own recovery image, not redistributed.
+  if [[ -f "${ISODIR}/recovery-${safe_name,,}.iso" ]]; then
+    inject_applevirtio_kext \
+      "${ISODIR}/recovery-${safe_name,,}.iso" \
+      "${ISODIR}/${iso_file}" \
+      "$logfile"
+  fi
 
   local cpu_args device_args='-device isa-applesmc,osk="ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc" -smbios type=2'
   if [[ "$version_name" =~ ^(Sonoma|Sequoia|Tahoe)$ ]]; then
