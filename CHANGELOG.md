@@ -62,7 +62,53 @@ OpenCore Changelog
   that downloads pinned OpenCore + kext releases, stages the EFI tree,
   stamps a 96 MiB MBR/FAT32 image and replaces the shipped ISO in place.
   Users can re-run it at any time to pick up newer releases.
+- **AMD CPU profile selection.** `setup` now detects the Ryzen (Zen)
+  generation on AMD hosts from `/proc/cpuinfo` and offers a `conservative` /
+  `aggressive` / `baseline` / `host` CPU profile choice when creating a VM,
+  recommending `conservative` or `aggressive` for Tahoe depending on Zen
+  generation and defaulting to the prior `baseline` behaviour everywhere
+  else. Override non-interactively with `OSX_AMD_CPU_PROFILE`.
 - `OCVERSION` in `setup` is now `1.0.7` and `HACKPXVERSION` = `2026.04.21`.
+
+#### 2026.04.20 – macOS Tahoe menu support, AMD boot-freeze fix, installer reliability
+
+- **macOS Tahoe (26) added to the setup menu** (option 9), routed through the
+  same recovery download, USB controller, and AMD CPU-model paths already
+  used for Sequoia/Sonoma.
+- **Fixed a 100% CPU freeze at the Apple logo** on AMD hosts for
+  Ventura/Sonoma/Sequoia VMs: the Cascadelake-Server `-cpu` string was
+  missing `+hypervisor`, `+kvm_pv_unhalt`, and `+kvm_pv_eoi`, so the guest
+  kernel busy-waited on halted vCPUs instead of yielding.
+- **`install.sh` reliability fixes:** now clones this fork
+  (`taylorelley/OSX-PROXMOX`) instead of upstream so `curl | bash` actually
+  installs the fork's fixes; reattaches stdin to `/dev/tty` so piped
+  (`curl | bash`) runs can still prompt interactively; and no longer deletes
+  the current working directory when run from inside the target install
+  directory.
+- Selectively adopted upstream PR #51's UX polish (colorized
+  `CHECK-IOMMU.sh`/`CREATE-ISO-macOS.command` output, `IOMMU-Groups.sh`
+  cleanup, safer `macrecovery/build-image.sh` cleanup trap) without its
+  regressions to this fork's installer safety fixes.
+
+#### 2026.04.01 – Proxmox VE 9.1 support & non-destructive installer
+
+- **Full Proxmox VE 9.1.x support**, replacing the prior "preliminary/BETA"
+  9.0 support, including PVE-9-specific handling of the enterprise
+  repository split (`pve-enterprise.sources`) via a new `PVE_MAJOR` check.
+- **`setup` is now safe to run on a host with existing VMs/LXCs**, not just a
+  fresh install:
+  - A pre-flight check summarizes existing VMs/LXCs/PCI-passthrough configs
+    and every change about to be made, and requires explicit `y/N`
+    confirmation (or aborts outright in a non-interactive shell).
+  - A new `--dry-run` flag previews all changes without applying them.
+  - Every system file `setup` touches is backed up first to
+    `/root/.osx-proxmox-backups` (configurable via `BACKUP_DIR`), with a
+    matching restore path.
+  - GPU/audio driver blacklisting, framebuffer disabling, unsafe VFIO
+    interrupts, and enterprise/ceph repo removal are now opt-in prompts
+    instead of unconditional; GRUB/IOMMU/VFIO changes are skipped when
+    already configured; a forced reboot is replaced with a warning-and-ask
+    when VMs/LXCs are running.
 
 #### v3.2.0
 
