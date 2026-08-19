@@ -30,7 +30,7 @@ Easily install macOS on Proxmox VE with just a few steps! This guide provides th
 
 ## 🛠 Installation Guide
 
-1. Install a **FRESH/CLEAN** version of Proxmox VE (v7.0.XX ~ 9.1.XX) - just follow the Next, Next & Finish (NNF) approach.
+1. Have a Proxmox VE host (v7.0.XX ~ 9.1.XX) ready. A **FRESH/CLEAN** install (Next, Next & Finish) works out of the box — but this fork also supports running on an **existing** Proxmox host with VMs/LXCs already on it; see [Running on an Existing Proxmox Host](#-running-on-an-existing-proxmox-host) below before proceeding on a production system.
 2. Open the **Proxmox Web Console** → Navigate to `Datacenter > YOUR_HOST_NAME > Shell`.
 3. Copy, paste, and execute the command below:
 
