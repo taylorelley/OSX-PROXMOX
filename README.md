@@ -2,12 +2,26 @@
   
 # 🚀 OSX-PROXMOX - Run macOS on ANY Computer (AMD & Intel)
 
-![GitHub stars](https://img.shields.io/github/stars/luchina-gabriel/osx-proxmox?style=flat-square)
-![GitHub forks](https://img.shields.io/github/forks/luchina-gabriel/OSX-PROXMOX?style=flat-square)
-![GitHub license](https://img.shields.io/github/license/luchina-gabriel/osx-proxmox?style=flat-square)
-![GitHub issues](https://img.shields.io/github/issues/luchina-gabriel/osx-proxmox?style=flat-square)
+![GitHub stars](https://img.shields.io/github/stars/taylorelley/osx-proxmox?style=flat-square)
+![GitHub forks](https://img.shields.io/github/forks/taylorelley/OSX-PROXMOX?style=flat-square)
+![GitHub license](https://img.shields.io/github/license/taylorelley/osx-proxmox?style=flat-square)
+![GitHub issues](https://img.shields.io/github/issues/taylorelley/osx-proxmox?style=flat-square)
+
+> This is a fork of [luchina-gabriel/OSX-PROXMOX](https://github.com/luchina-gabriel/OSX-PROXMOX) — all credit for the original tooling, EFI work, and macOS-on-Proxmox research goes to Gabriel Luchina and upstream's contributors. This fork builds on that base with Proxmox VE 9.1 support, a non-destructive installer for hosts with existing VMs/LXCs, macOS Tahoe support, AMD CPU profile detection, and per-VM OpenCore ISOs — see [CHANGELOG.md](CHANGELOG.md) for details. Development happens independently here, so expect this fork to keep diverging from upstream over time: some upstream fixes are deliberately not adopted (see the "Selectively adopt..." entries in the changelog) where they'd conflict with this fork's own fixes, and some fixes here may never be upstreamed.
 
 </div>
+
+## 📖 Table of Contents
+- [Installation Guide](#-installation-guide)
+- [Running on an Existing Proxmox Host](#-running-on-an-existing-proxmox-host)
+- [Additional Configuration](#-additional-configuration)
+- [macOS Versions Supported](#-macos-versions-supported)
+- [Proxmox VE Versions Supported](#-proxmox-ve-versions-supported)
+- [Cloud Support](#-cloud-support-run-hackintosh-in-the-cloud)
+- [Disclaimer](#-disclaimer)
+- [Requirements](#-requirements)
+- [Troubleshooting](#-troubleshooting)
+- [Credits](#-credits)
 
 ![v15 - Sequoia](https://github.com/user-attachments/assets/4efd8874-dbc8-48b6-a485-73f7c38a5e06)
 Easily install macOS on Proxmox VE with just a few steps! This guide provides the simplest and most effective way to set up macOS on Proxmox, whether you're using AMD or Intel hardware.
@@ -21,11 +35,48 @@ Easily install macOS on Proxmox VE with just a few steps! This guide provides th
 3. Copy, paste, and execute the command below:
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://install.osx-proxmox.com)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/taylorelley/OSX-PROXMOX/main/install.sh)"
 ```
+
+> ⚠️ The upstream `https://install.osx-proxmox.com` shortlink clones
+> [luchina-gabriel/OSX-PROXMOX](https://github.com/luchina-gabriel/OSX-PROXMOX), **not** this fork.
+> Use the raw GitHub URL above (which is what `install.sh` itself now clones — see
+> [CHANGELOG.md](CHANGELOG.md)) to get this fork's Proxmox 9.1, Tahoe, and safety fixes.
 
 🎉 Voilà! You can now install macOS!
 ![osx-terminal](https://github.com/user-attachments/assets/ea81b920-f3e2-422e-b1ff-0d9045adc55e)
+---
+
+## 🛡 Running on an Existing Proxmox Host
+
+`setup` no longer assumes a fresh install. On an existing host it:
+
+- **Runs a pre-flight check** listing any existing VMs, LXCs, PCI passthrough
+  configs, and pre-existing `/etc/modprobe.d/kvm.conf`, plus a summary of what
+  it's about to change (GRUB/IOMMU, VFIO modules, KVM modprobe configs,
+  packages), and asks for `y/N` confirmation before touching anything.
+- **Backs up every file it modifies** (`/etc/default/grub`, `/etc/modules`,
+  `/etc/modprobe.d/`, `/etc/apt/sources.list[.d]`, `/etc/environment`,
+  the Proxmox subscription-nag JS) to a timestamped directory under
+  `/root/.osx-proxmox-backups` (override with `BACKUP_DIR=<path> ./setup`)
+  before making changes.
+- **Makes disruptive steps opt-in** rather than automatic: blacklisting
+  GPU/audio drivers, disabling the framebuffer, allowing unsafe VFIO
+  interrupts, and removing the enterprise/ceph APT repositories all prompt
+  first. GRUB/IOMMU changes and VFIO module loading are skipped if already
+  configured, and it warns before enabling IOMMU when it finds existing PCI
+  passthrough configs (group assignments can shift after the reboot).
+- **Never force-reboots.** If running VMs or LXCs are detected, `setup` asks
+  before rebooting instead of doing it automatically.
+- **Refuses to run unattended.** Piping `setup` into a non-interactive shell
+  aborts at the pre-flight check rather than silently applying changes.
+
+Preview what would change without touching the system:
+
+```bash
+./setup --dry-run
+```
+
 ---
 
 ## 🔧 Additional Configuration
@@ -235,10 +286,13 @@ Every VM creation appends the VM config, `lscpu`, `dmesg | grep clocksource`, `k
 📽️ [Watch on YouTube](https://youtu.be/dil6iRWiun0)  
 *(Enable auto-translate captions for English subtitles!)*
 
+*Video and Discord community below are maintained by the upstream project.*
+
 ---
 
 ## 🎖 Credits
 
+- **[Gabriel Luchina](https://github.com/luchina-gabriel) & the [upstream OSX-PROXMOX](https://github.com/luchina-gabriel/OSX-PROXMOX) contributors** - Created and maintain the original project this fork is built on; this fork exists only because of their work
 - **OpenCore/Acidanthera Team** - Open-source bootloader
 - **Corpnewt** - Tools (ProperTree, GenSMBIOS, etc.)
 - **Apple** - macOS
