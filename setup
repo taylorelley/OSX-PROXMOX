@@ -37,7 +37,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOGDIR="${SCRIPT_DIR}/logs"
 MAIN_LOG="${LOGDIR}/main.log"
 TMPDIR="${SCRIPT_DIR}/tmp"
-HACKPXVERSION="2026.04.21"
+HACKPXVERSION="2026.08.19"
 OCVERSION="1.0.7"
 DEFAULT_VM_PREFIX="HACK-"
 BASE_RAM_SIZE=4096
@@ -834,6 +834,132 @@ download_recovery_image() {
   display_and_log "Recovery image created successfully" "$logfile"
 }
 
+# Map macOS version name -> default SMBIOS model for per-VM OpenCore ISOs.
+# Tahoe's installer rejects iMacPro1,1 (not on its supported-model list);
+# MacPro7,1 is supported there and its "memory modules misconfigured" nag is
+# silenced by RestrictEvents.kext. Override with OSX_SMBIOS_MODEL.
+default_smbios_model_for_version() {
+  case "$1" in
+    Tahoe) echo "MacPro7,1" ;;
+    *)     echo "iMacPro1,1" ;;
+  esac
+}
+
+# Ensure the GenSMBIOS submodule is checked out, auto-initializing it if a
+# plain `git clone` (without --recurse-submodules) left it empty. Returns
+# non-zero if it's still missing after trying; caller decides fatal or not.
+ensure_gensmbios() {
+  local logfile=$1
+  [[ -f "$SCRIPT_DIR/tools/GenSMBIOS/GenSMBIOS.py" ]] && return 0
+  display_and_log "GenSMBIOS submodule missing; running git submodule update --init..." "$logfile"
+  git -C "$SCRIPT_DIR" submodule update --init tools/GenSMBIOS >>"$logfile" 2>&1
+  [[ -f "$SCRIPT_DIR/tools/GenSMBIOS/GenSMBIOS.py" ]]
+}
+
+# Non-interactively generate a fresh SMBIOS (given $model) into $json_path
+# via GenSMBIOS. Never prompts and never fatal: SMBIOS generation needs
+# network access for macserial, so on failure the caller just falls back to
+# shared defaults instead of aborting VM creation.
+generate_vm_smbios() {
+  local model=$1 json_path=$2 logfile=$3
+  ensure_gensmbios "$logfile" || { display_and_log "GenSMBIOS unavailable; skipping per-VM SMBIOS." "$logfile"; return 1; }
+  python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --install >>"$logfile" 2>&1
+  python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --generate "$model" -j "$json_path" >>"$logfile" 2>&1 || {
+    display_and_log "Failed to generate SMBIOS for $model; skipping per-VM SMBIOS." "$logfile"
+    return 1
+  }
+}
+
+# Non-interactively apply SMBIOS values (SystemProductName/SystemSerialNumber/
+# MLB/SystemUUID/ROM) from $json_path into $iso's config.plist. If $rom_hex
+# (a colon-stripped MAC) is given, it overrides the JSON's ROM and is written
+# back into the JSON so later refreshes stay consistent; if $json_path is
+# missing, a JSON holding only the ROM override is created. Warns and
+# returns non-zero on failure; never aborts the caller. Uses a unique
+# mountpoint (PID-suffixed) so concurrent calls never collide.
+apply_smbios_to_iso() {
+  local iso=$1 json_path=$2 rom_hex=${3:-}
+  local logfile="${LOGDIR}/apply-smbios.log"
+  ensure_xmlstarlet_dependency
+  ensure_base64_xxd_dependency "$logfile"
+  ensure_jq_dependency
+
+  if [[ -n "$rom_hex" ]]; then
+    if [[ -f "$json_path" ]]; then
+      jq --arg rom "$rom_hex" '.ROM = $rom' "$json_path" > "${json_path}.tmp" \
+        && mv "${json_path}.tmp" "$json_path"
+    else
+      jq -n --arg rom "$rom_hex" '{ROM: $rom}' > "$json_path"
+    fi
+  fi
+
+  if [[ ! -f "$json_path" ]]; then
+    display_and_log "No SMBIOS JSON at $json_path; skipping." "$logfile"
+    return 1
+  fi
+
+  local mountpoint="/mnt/opencore-$$"
+  local loopdev
+  loopdev=$(losetup -f --show -P "$iso") || { display_and_log "Failed to set up loop device for $iso" "$logfile"; return 1; }
+  if ! mkdir -p "$mountpoint" >>"$logfile" 2>&1; then
+    display_and_log "Failed to create mount point $mountpoint" "$logfile"
+    losetup -d "$loopdev" >>"$logfile" 2>&1
+    return 1
+  fi
+  if ! mount "${loopdev}p1" "$mountpoint" >>"$logfile" 2>&1; then
+    display_and_log "Failed to mount $iso" "$logfile"
+    losetup -d "$loopdev" >>"$logfile" 2>&1
+    rmdir "$mountpoint" 2>/dev/null
+    return 1
+  fi
+
+  local config="$mountpoint/EFI/OC/config.plist"
+  local platform_generic_xpath="//key[text()='PlatformInfo']/following-sibling::dict/key[text()='Generic']/following-sibling::dict"
+
+  declare -A json_values
+  json_values["SystemProductName"]=$(jq -r '.Type // empty' "$json_path")
+  json_values["SystemSerialNumber"]=$(jq -r '.Serial // empty' "$json_path")
+  json_values["MLB"]=$(jq -r '."Board Serial" // empty' "$json_path")
+  json_values["SystemUUID"]=$(jq -r '.SmUUID // empty' "$json_path")
+  json_values["ROM"]=$(jq -r '.ROM // empty' "$json_path")
+
+  local key modified_value
+  for key in SystemProductName SystemSerialNumber MLB SystemUUID ROM; do
+    [[ -n "${json_values[$key]}" ]] || continue
+    if [[ "$key" == "ROM" ]]; then
+      if command -v base64 >/dev/null 2>&1 && command -v xxd >/dev/null 2>&1; then
+        modified_value=$(echo -n "${json_values[$key]}" | xxd -r -p | base64)
+      else
+        display_and_log "Warning: base64 or xxd not available. Skipping ROM update." "$logfile"
+        continue
+      fi
+    else
+      modified_value="${json_values[$key]}"
+    fi
+    xmlstarlet ed -L -u "${platform_generic_xpath}/key[text()='${key}']/following-sibling::*[1]" -v "$modified_value" "$config" \
+      || display_and_log "Warning: failed to update $key in $config" "$logfile"
+  done
+
+  umount "$mountpoint" >>"$logfile" 2>&1
+  losetup -d "$loopdev" >>"$logfile" 2>&1
+  rmdir "$mountpoint" 2>/dev/null
+  display_and_log "Applied SMBIOS from $json_path to $iso" "$logfile"
+}
+
+# Copy the shared OpenCore ISO to a per-VM ISO and generate a version-
+# appropriate SMBIOS JSON for it. Echoes the per-VM ISO filename on success.
+# Never fatal: on any failure the caller falls back to the shared ISO.
+create_vm_opencore_iso() {
+  local vm_id=$1 model=$2 logfile=$3
+  local dest_name="opencore-vm${vm_id}.iso"
+  local dest="${ISODIR}/${dest_name}"
+  local json_path="${ISODIR}/.smbios-vm${vm_id}.json"
+
+  cp -f "${ISODIR}/${OPENCORE_ISO}" "$dest" || { display_and_log "Failed to copy per-VM OpenCore ISO" "$logfile"; return 1; }
+  generate_vm_smbios "$model" "$json_path" "$logfile"
+  echo "$dest_name"
+}
+
 # Classify the host AMD generation by CPU feature flags.
 # Echoes one of: zen1 | zen2 | zen3 | zen4plus | unknown
 detect_amd_zen_gen() {
@@ -869,7 +995,7 @@ recommend_amd_cpu_profile() {
 
 # Function to create VM
 create_vm() {
-  local iso_file version_name=$1 vm_id=$2 vm_name=$3 disk_size=$4 storage=$5 core_count=$6 ram_size=$7 iso_size=$8 disk_type=$9 bridge=${10}
+  local iso_file version_name=$1 vm_id=$2 vm_name=$3 disk_size=$4 storage=$5 core_count=$6 ram_size=$7 iso_size=$8 disk_type=$9 bridge=${10} smbios_model=${11}
   local safe_name="${version_name// /-}"
   local logfile="${LOGDIR}/crt-vm-${OSX_PLATFORM,,}-${safe_name,,}.log"
   iso_file="${OPENCORE_ISO}"
@@ -877,6 +1003,16 @@ create_vm() {
     update_opencore_iso
   fi
   [[ ! -d "/sys/class/net/$bridge" ]] && log_and_exit "Bridge $bridge does not exist" "$logfile"
+
+  # Per-VM OpenCore ISO: gives each VM its own SMBIOS/serial instead of every
+  # VM sharing one hardcoded serial. Falls back to the shared ISO on failure.
+  local per_vm_iso_name
+  if per_vm_iso_name=$(create_vm_opencore_iso "$vm_id" "${smbios_model:-$(default_smbios_model_for_version "$version_name")}" "$logfile"); then
+    iso_file="$per_vm_iso_name"
+  else
+    display_and_log "WARNING: could not create per-VM OpenCore ISO; using shared ${OPENCORE_ISO}" "$logfile"
+  fi
+  local oc_iso_mb=$(( ( $(stat -c%s "${ISODIR}/${iso_file}") + 1048575 ) / 1048576 ))
 
   local cpu_args device_args='-device isa-applesmc,osk="ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc" -smbios type=2'
   if [[ "$version_name" =~ ^(Sonoma|Sequoia|Tahoe)$ ]]; then
@@ -993,9 +1129,20 @@ create_vm() {
     --onboot 0 --ostype other --sockets 1 --start 0 --tablet 1 \
     --vga vmware --vmgenid 1 --scsihw virtio-scsi-pci \
     --"$disk_type" "${storage}:${disk_size},cache=none,discard=on" \
-    --ide0 "${storage_iso}:iso/${iso_file},media=cdrom,cache=unsafe,size=96M" \
+    --ide0 "${storage_iso}:iso/${iso_file},media=cdrom,cache=unsafe,size=${oc_iso_mb}M" \
     --ide2 "${storage_iso}:iso/recovery-${safe_name,,}.iso,media=cdrom,cache=unsafe,size=${iso_size}" >>"$logfile" 2>&1 || log_and_exit "Failed to create VM" "$logfile"
   sed -i 's/media=cdrom/media=disk/' "/etc/pve/qemu-server/$vm_id.conf" >>"$logfile" 2>&1 || log_and_exit "Failed to update VM config" "$logfile"
+
+  # ROM = this VM's net0 MAC (standard iMessage/Apple ID hygiene: every VM
+  # otherwise shares the same ROM baked into the base ISO). Only touches the
+  # per-VM ISO copy, never the shared base.
+  if [[ "$iso_file" != "$OPENCORE_ISO" ]]; then
+    local vm_mac rom_hex
+    vm_mac=$(awk -F'[=,]' '/^net0:/ {print $2; exit}' "/etc/pve/qemu-server/$vm_id.conf")
+    rom_hex="${vm_mac//:/}"
+    apply_smbios_to_iso "${ISODIR}/${iso_file}" "${ISODIR}/.smbios-vm${vm_id}.json" "$rom_hex" \
+      || display_and_log "WARNING: per-VM SMBIOS/ROM not applied; VM boots with defaults (menu 205 to customize)" "$logfile"
+  fi
 
   {
     echo "===== VM CONFIG (${vm_id}) ====="
@@ -1056,7 +1203,7 @@ update_opencore_smbios() {
         if [ -n "$new_value" ] && [ "$new_value" != "$SystemProductName" ]; then
           SystemProductName="$new_value"
         fi
-      [[ -f "$SCRIPT_DIR/tools/GenSMBIOS/GenSMBIOS.py" ]] || log_and_exit "GenSMBIOS not found. Run: git submodule update --init" "$logfile"
+      ensure_gensmbios "$logfile" || log_and_exit "GenSMBIOS not found and could not be auto-initialized. Run: git submodule update --init" "$logfile"
       python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --install
       python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --generate "$SystemProductName" -j "$oc_json_path" >>"$logfile" 2>&1 || log_and_exit "Failed to generate SMBIOS" "$logfile"
     else
@@ -1162,11 +1309,85 @@ update_opencore_smbios() {
   losetup -d "$loopdev" >>"$logfile" 2>&1 || log_and_exit "Failed to detach loop device" "$logfile"
 }
 
+# List the base OpenCore ISO plus any per-VM ISOs and let the user pick
+# which one to customize. Sets the caller's $1 (iso path) and $2 (matching
+# SMBIOS JSON path) variables by name. Auto-selects the base ISO when it's
+# the only one present, so installs with no per-VM ISOs see no change.
+select_opencore_iso() {
+  local -n _select_iso_ref=$1
+  local -n _select_json_ref=$2
+  local choices=() labels=()
+  choices+=("${ISODIR}/${OPENCORE_ISO}")
+  labels+=("Base OpenCore ISO (${OPENCORE_ISO}) [shared/default]")
+
+  local iso vm_id vm_name
+  for iso in "${ISODIR}"/opencore-vm*.iso; do
+    [[ -e "$iso" ]] || continue
+    vm_id=$(basename "$iso" | sed -E 's/opencore-vm([0-9]+)\.iso/\1/')
+    if [[ -e "/etc/pve/qemu-server/${vm_id}.conf" ]]; then
+      vm_name=$(awk -F': ' '/^name:/ {print $2; exit}' "/etc/pve/qemu-server/${vm_id}.conf")
+      labels+=("VM ${vm_id} (${vm_name:-unnamed}): $(basename "$iso")")
+    else
+      labels+=("$(basename "$iso") (orphan - VM ${vm_id} no longer exists)")
+    fi
+    choices+=("$iso")
+  done
+
+  local selected_iso
+  if ((${#choices[@]} == 1)); then
+    selected_iso="${choices[0]}"
+  else
+    echo ""
+    echo "Multiple OpenCore ISOs found:"
+    local i
+    for i in "${!choices[@]}"; do
+      echo "  $((i+1)) - ${labels[$i]}"
+    done
+    local pick
+    read -rp "Select ISO to customize [1]: " pick
+    pick=${pick:-1}
+    if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#choices[@]} )); then
+      selected_iso="${choices[$((pick-1))]}"
+    else
+      selected_iso="${choices[0]}"
+    fi
+  fi
+
+  _select_iso_ref="$selected_iso"
+  if [[ "$selected_iso" == "${ISODIR}/${OPENCORE_ISO}" ]]; then
+    _select_json_ref="${ISODIR}/.smbios.json"
+  else
+    local vmid
+    vmid=$(basename "$selected_iso" | sed -E 's/opencore-vm([0-9]+)\.iso/\1/')
+    _select_json_ref="${ISODIR}/.smbios-vm${vmid}.json"
+  fi
+}
+
+# Remove per-VM OpenCore ISOs (and their SMBIOS JSON) whose VM no longer
+# exists. Proxmox's "Destroy VM" doesn't clean up ISO-storage volumes, so
+# these orphans are expected after deleting VMs created with a per-VM ISO.
+cleanup_orphan_opencore_isos() {
+  local found=false iso vm_id
+  for iso in "${ISODIR}"/opencore-vm*.iso; do
+    [[ -e "$iso" ]] || continue
+    vm_id=$(basename "$iso" | sed -E 's/opencore-vm([0-9]+)\.iso/\1/')
+    if [[ ! -e "/etc/pve/qemu-server/${vm_id}.conf" ]]; then
+      found=true
+      read -rp "VM $vm_id no longer exists. Delete $(basename "$iso") + its SMBIOS JSON? [y/N]: " ans
+      if [[ "$ans" =~ ^[Yy]$ ]]; then
+        rm -f "$iso" "${ISODIR}/.smbios-vm${vm_id}.json"
+        echo "Removed $(basename "$iso")"
+      fi
+    fi
+  done
+  $found || echo "No orphaned per-VM OpenCore ISOs found."
+  read -n 1 -sp "Press any key to return to menu..."
+}
+
 # Cleaned function to customize OpenCore config.plist
 customize_opencore_config() {
   local oc_json_path iso logfile="${LOGDIR}/custom-oc-config.plist.log"
-  iso="${ISODIR}/${OPENCORE_ISO}"
-  oc_json_path="${ISODIR}/.smbios.json"
+  select_opencore_iso iso oc_json_path
   ensure_xmlstarlet_dependency
   ensure_base64_xxd_dependency "$logfile"
   ensure_jq_dependency
@@ -1253,7 +1474,7 @@ customize_opencore_config() {
       if [ -n "$new_value" ] && [ "$new_value" != "$SystemProductName" ]; then
         SystemProductName="$new_value"
       fi
-    [[ -f "$SCRIPT_DIR/tools/GenSMBIOS/GenSMBIOS.py" ]] || log_and_exit "GenSMBIOS not found. Run: git submodule update --init" "$logfile"
+    ensure_gensmbios "$logfile" || log_and_exit "GenSMBIOS not found and could not be auto-initialized. Run: git submodule update --init" "$logfile"
     python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --install
     python3 "$SCRIPT_DIR"/tools/GenSMBIOS/GenSMBIOS.py --generate "$SystemProductName" -j "$oc_json_path" >>"$logfile" 2>&1 || log_and_exit "Failed to generate SMBIOS" "$logfile"
     # Apply new JSON
@@ -1433,18 +1654,49 @@ customize_opencore_config() {
 
 # Function to update OpenCore ISO
 update_opencore_iso() {
-  local iso_path
+  local iso_path oc_json_path
   local logfile="${LOGDIR}/update-opencore-iso.log"
-  local iso_url="https://github.com/luchina-gabriel/OSX-PROXMOX/raw/main/EFI/opencore-osx-proxmox-vm.iso"
+  local repo_iso_url="https://github.com/taylorelley/OSX-PROXMOX/raw/main/EFI/opencore-osx-proxmox-vm.iso"
+  local local_iso="${SCRIPT_DIR}/EFI/${OPENCORE_ISO}"
   iso_path="${ISODIR}/${OPENCORE_ISO}"
   oc_json_path="${ISODIR}/.smbios.json"
 
-  rm -f "$iso_path" >>"$logfile" 2>&1
-  if ! wget -q -O "$iso_path" "$iso_url" >>"$logfile" 2>&1; then
-    log_and_exit "Failed to download OpenCore ISO" "$logfile"
+  # Prefer the local repo checkout (this fork's build, e.g. after `git pull`)
+  # over the network so users always get this fork's OpenCore build rather
+  # than upstream's. Download to a temp file first so a failed fetch never
+  # strands the user without a working ISO.
+  local tmp_iso="${iso_path}.tmp.$$"
+  if [[ -f "$local_iso" ]]; then
+    display_and_log "Copying OpenCore ISO from local repo checkout..." "$logfile"
+    cp -f "$local_iso" "$tmp_iso" >>"$logfile" 2>&1 || log_and_exit "Failed to copy local OpenCore ISO" "$logfile"
+  else
+    display_and_log "Downloading OpenCore ISO from $repo_iso_url..." "$logfile"
+    if ! wget -q -O "$tmp_iso" "$repo_iso_url" >>"$logfile" 2>&1; then
+      rm -f "$tmp_iso"
+      log_and_exit "Failed to download OpenCore ISO" "$logfile"
+    fi
   fi
+  mv -f "$tmp_iso" "$iso_path" || log_and_exit "Failed to install OpenCore ISO" "$logfile"
+
   ensure_base64_xxd_dependency
   update_opencore_smbios "$iso_path" "$oc_json_path"
+
+  # Offer to refresh any existing per-VM ISOs from the freshly-updated base.
+  local iso vm_id
+  for iso in "${ISODIR}"/opencore-vm*.iso; do
+    [[ -e "$iso" ]] || continue
+    vm_id=$(basename "$iso" | sed -E 's/opencore-vm([0-9]+)\.iso/\1/')
+    [[ -e "/etc/pve/qemu-server/${vm_id}.conf" ]] || continue
+    if [ -t 0 ]; then
+      read -rp "Refresh per-VM OpenCore ISO for VM $vm_id from the updated base? [y/N]: " refresh_choice
+      [[ "$refresh_choice" =~ ^[Yy]$ ]] || continue
+    else
+      continue
+    fi
+    cp -f "$iso_path" "$iso" || { display_and_log "Failed to refresh $iso" "$logfile"; continue; }
+    apply_smbios_to_iso "$iso" "${ISODIR}/.smbios-vm${vm_id}.json" \
+      || display_and_log "WARNING: failed to reapply SMBIOS to $iso" "$logfile"
+  done
 
   display_and_log "OpenCore ISO updated" "$logfile"
   sleep 5
@@ -1993,7 +2245,16 @@ configure_macos_vm() {
   # Recovery Image
   read -rp "Download recovery image? [Y/n]: " CRTRECODISK
   [[ "${CRTRECODISK:-Y}" =~ ^[Yy]$ ]] && download_recovery_image "$version_name" "$board_id" "$model_id" "$iso_size"
-  create_vm "$version_name" "$VM_ID" "$VM_NAME" "$SIZEDISK" "$STORAGECRTVM" "$PROC_COUNT" "$RAM_SIZE" "$iso_size" "$disk_type" "$BRIDGECRTVM"
+
+  # SMBIOS model for this VM's per-VM OpenCore ISO
+  local smbios_model
+  smbios_model="${OSX_SMBIOS_MODEL:-$(default_smbios_model_for_version "$version_name")}"
+  if [[ -z "${OSX_SMBIOS_MODEL:-}" && -t 0 ]]; then
+    read -rp "SMBIOS model for this VM [${smbios_model}]: " smbios_model_input
+    [[ -n "$smbios_model_input" ]] && smbios_model="$smbios_model_input"
+  fi
+
+  create_vm "$version_name" "$VM_ID" "$VM_NAME" "$SIZEDISK" "$STORAGECRTVM" "$PROC_COUNT" "$RAM_SIZE" "$iso_size" "$disk_type" "$BRIDGECRTVM" "$smbios_model"
   read -n 1 -sp "Press any key to return to menu..."
 }
 
@@ -2018,7 +2279,7 @@ main_menu() {
       echo "$version|$key"
     done | sort -t'|' -k1,1V | cut -d'|' -f2); do
       IFS='|' read -r name version _ _ _ _ <<< "${MACOS_CONFIG[$i]}"
-      [[ "$name" == "Sequoia" ]] && display_name="macOS Sequoia" || display_name="$name"
+      display_name="macOS $name"
       echo " $i - $display_name - $version"
     done
     echo
@@ -2029,6 +2290,7 @@ main_menu() {
     echo " 203 - Remove Proxmox subscription notice"
     echo " 204 - Add new bridge (macOS in cloud)"
     echo " 205 - Customize OpenCore config.plist"
+    echo " 206 - Clean up orphaned per-VM OpenCore ISOs"
     echo
     echo " 0 - Quit (or ENTER)"
     echo
@@ -2045,6 +2307,7 @@ main_menu() {
         203) remove_subscription_notice ;;
         204) configure_network_bridge ;;
         205) customize_opencore_config ;;
+        206) cleanup_orphan_opencore_isos ;;
         *) echo "Invalid option"; read -n 1 -s ;;
       esac
     fi
@@ -2077,7 +2340,7 @@ check_proxmox_version
 set_isodir
 # Check if OpenCore ISO exists, and install if not in the ISODIR.
 if [ ! -f "${ISODIR}/${OPENCORE_ISO}" ]; then
-  update_opencore_iso "0"
+  update_opencore_iso
 fi
 sleep 4
 OSX_PLATFORM=$(detect_cpu_platform)

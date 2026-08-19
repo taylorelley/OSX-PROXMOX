@@ -11,10 +11,13 @@
 # Why this exists: OpenCore 1.0.5 was the first release with macOS Tahoe
 # (Darwin 26) kext-injection fixes, and 1.0.7 added XhciPortLimit
 # compatibility. Keep the bundled image synced with upstream so users don't
-# hit injection panics on Tahoe installs.
+# hit injection panics on Tahoe installs. Also installs RestrictEvents +
+# NVMeFix, caps WhateverGreen below Tahoe, and applies the hv_vmm_present
+# VMM-mask kernel patch (see tools/patch_config.py) so Apple ID/iMessage/
+# FaceTime work under KVM.
 #
 # Requirements on the build host: bash, curl, unzip, xmlstarlet, mtools,
-# dosfstools, python3 (for plistlib), optionally xxd.
+# dosfstools, python3 (for plistlib).
 #
 # Usage:
 #   sudo ./tools/build-opencore-iso.sh                # rebuild in place
@@ -30,11 +33,12 @@ OC_VERSION="${OC_VERSION:-1.0.7}"
 LILU_VERSION="${LILU_VERSION:-1.7.2}"
 VIRTUALSMC_VERSION="${VIRTUALSMC_VERSION:-1.3.7}"
 WHATEVERGREEN_VERSION="${WHATEVERGREEN_VERSION:-1.7.0}"
-# The following are not installed into Kexts/ by default but are downloaded so
-# that operators can opt in via config.plist when building custom images.
-APPLEALC_VERSION="${APPLEALC_VERSION:-1.9.7}"
 RESTRICTEVENTS_VERSION="${RESTRICTEVENTS_VERSION:-1.1.6}"
 NVMEFIX_VERSION="${NVMEFIX_VERSION:-1.1.3}"
+# Downloaded so operators can opt in via config.plist when building custom
+# images, but not installed into Kexts/ by default (AppleALC needs a codec
+# layout ID nothing here can guess, and virtio disks have no analog audio).
+APPLEALC_VERSION="${APPLEALC_VERSION:-1.9.7}"
 
 IMAGE_SIZE_MIB="${IMAGE_SIZE_MIB:-96}"
 
@@ -59,7 +63,7 @@ drive x: file="$OUT_ISO" offset=512
 EOF
 export MTOOLSRC="$WORK/mtoolsrc" MTOOLS_SKIP_CHECK=1
 
-echo "[1/6] Extracting existing ISO for reuse..."
+echo "[1/7] Extracting existing ISO for reuse..."
 mcopy -s -n x:/EFI "$SRC/" >/dev/null
 mcopy -s -n x:/SOURCE "$SRC/" >/dev/null || true
 mcopy -s -n x:/UTILS  "$SRC/" >/dev/null || true
@@ -80,7 +84,7 @@ fetch() {
   curl -fsSL --retry 4 --retry-delay 2 -o "$dest" "$url"
 }
 
-echo "[2/6] Downloading OpenCore $OC_VERSION + kexts..."
+echo "[2/7] Downloading OpenCore $OC_VERSION + kexts..."
 fetch "https://github.com/acidanthera/OpenCorePkg/releases/download/${OC_VERSION}/OpenCore-${OC_VERSION}-RELEASE.zip"               "$DL/OpenCore.zip"
 fetch "https://github.com/acidanthera/Lilu/releases/download/${LILU_VERSION}/Lilu-${LILU_VERSION}-RELEASE.zip"                       "$DL/Lilu.zip"
 fetch "https://github.com/acidanthera/VirtualSMC/releases/download/${VIRTUALSMC_VERSION}/VirtualSMC-${VIRTUALSMC_VERSION}-RELEASE.zip" "$DL/VirtualSMC.zip"
@@ -101,7 +105,7 @@ unzip -q -o "$DL/NVMeFix.zip"        -d "$DL/NVMeFix"
 
 # --- 3. Assemble staging EFI tree from the existing layout -----------------
 
-echo "[3/6] Staging EFI tree..."
+echo "[3/7] Staging EFI tree..."
 cp -a "$SRC/EFI" "$STAGE/"
 # Also carry the repo-local helpers and top-level .pkg blobs.
 [[ -d "$SRC/SOURCE" ]] && cp -a "$SRC/SOURCE" "$STAGE/"
@@ -142,24 +146,83 @@ replace_kext Lilu          "$DL/Lilu"
 replace_kext VirtualSMC    "$DL/VirtualSMC/Kexts"
 replace_kext WhateverGreen "$DL/WhateverGreen"
 
-# --- 4. Sanity-touch config.plist ------------------------------------------
+# Install RestrictEvents + NVMeFix (required companions for the VMM-mask
+# kernel patch applied below: RestrictEvents backs revpatch=sbvmm so OTA
+# updates keep working, and silences MacPro7,1's memory-config nag; NVMeFix
+# is harmless on virtio disks and needed for NVMe passthrough). Installed
+# into the base EFI/OC/Kexts tree and every SOURCE/EFI-*/EFI/OC/Kexts
+# variant tree so their config.plist Kernel>Add entries (added below) never
+# point at a missing bundle.
+install_kext() {
+  local name="$1" src_zip_dir="$2" dst_root="$3"
+  local dst="$dst_root/${name}.kext"
+  local src="$src_zip_dir/${name}.kext"
+  [[ -d "$src" ]] || { echo "Kext source missing: $src" >&2; exit 1; }
+  rm -rf "$dst"
+  cp -a "$src" "$dst"
+}
+install_kext RestrictEvents "$DL/RestrictEvents" "$STAGE/EFI/OC/Kexts"
+install_kext NVMeFix        "$DL/NVMeFix"        "$STAGE/EFI/OC/Kexts"
+for vdir in "$STAGE"/SOURCE/EFI-*/EFI/OC/Kexts; do
+  [[ -d "$vdir" ]] || continue
+  install_kext RestrictEvents "$DL/RestrictEvents" "$vdir"
+  install_kext NVMeFix        "$DL/NVMeFix"        "$vdir"
+done
+
+# --- 4. Normalise config.plist ----------------------------------------------
 #
-# Dortania's Tahoe guide calls out SecureBootModel=Disabled for VM installs.
-# We re-apply it idempotently so future rebuilds stay consistent even if the
-# extracted config.plist diverges.
+# Idempotent pass applied to the base config.plist and all four SOURCE
+# variant configs:
+#   - SecureBootModel=Disabled (Dortania recommendation for VM installs)
+#   - Rewrite the stale "# BASE EFI ... OC 1.0.x" header comment
+#   - Kernel>Add: install RestrictEvents.kext + NVMeFix.kext, cap
+#     WhateverGreen at MaxKernel=24.99.99 (AMD GPU connector patching is
+#     broken on Tahoe/Darwin 25+ per Dortania's Tahoe guide)
+#   - Kernel>Patch: append the hv_vmm_present<->hibernatecount swap from
+#     Artefacts/Patches/.../patch-bcm-virtual.plist (Apple ID/iMessage/
+#     FaceTime under KVM), MinKernel raised to 24.0.0
+#   - NVRAM boot-args: append revpatch=sbvmm (companion for RestrictEvents
+#     so OTA updates keep working once the VMM is masked)
 
-echo "[4/6] Normalising config.plist (SecureBootModel=Disabled)..."
-python3 - "$STAGE/EFI/OC/config.plist" <<'PYEOF'
-import plistlib, sys
-p = sys.argv[1]
-with open(p, 'rb') as f: cfg = plistlib.load(f)
-cfg.setdefault('Misc', {}).setdefault('Security', {})['SecureBootModel'] = 'Disabled'
-with open(p, 'wb') as f: plistlib.dump(cfg, f)
-PYEOF
+echo "[4/7] Normalising config.plist files..."
+BCM_PATCH="$REPO_DIR/Artefacts/Patches/BCM94360 - Bluetooth - Sonoma and Sequoia/patch-bcm-virtual.plist"
+[[ -f "$BCM_PATCH" ]] || { echo "Missing VMM-mask patch source: $BCM_PATCH" >&2; exit 1; }
 
-# --- 5. Build the new FAT32 image ------------------------------------------
+CONFIGS=( "$STAGE/EFI/OC/config.plist" )
+while IFS= read -r -d '' c; do CONFIGS+=( "$c" ); done \
+  < <(find "$STAGE/SOURCE" -name config.plist -print0 2>/dev/null)
 
-echo "[5/6] Building 96 MiB FAT32 image..."
+for c in "${CONFIGS[@]}"; do
+  echo "  patching ${c#"$STAGE"/}"
+  python3 "$SCRIPT_DIR/patch_config.py" "$c" "$OC_VERSION" "$BCM_PATCH"
+done
+
+# --- 5. Validate with ocvalidate --------------------------------------------
+#
+# Use the ocvalidate binary from the OC_VERSION release zip we already
+# downloaded above -- NOT the ISO's bundled UTILS copy, which is pinned to
+# OpenCore 1.0.4 and rejects 1.0.7 configs. Best-effort: skip if the Linux
+# binary isn't runnable on this host (e.g. non-x86_64 build machine).
+
+echo "[5/7] Validating config.plist files with ocvalidate..."
+OCVALIDATE="$DL/OpenCore/Utilities/ocvalidate/ocvalidate.linux"
+if [[ -f "$OCVALIDATE" ]]; then
+  chmod +x "$OCVALIDATE"
+  if "$OCVALIDATE" "$STAGE/EFI/OC/config.plist" >/dev/null 2>&1; then
+    for c in "${CONFIGS[@]}"; do
+      echo "  validating ${c#"$STAGE"/}"
+      "$OCVALIDATE" "$c" || { echo "ocvalidate failed on $c" >&2; exit 1; }
+    done
+  else
+    echo "  ocvalidate.linux is not runnable on this host; skipping validation." >&2
+  fi
+else
+  echo "  ocvalidate.linux not found in OpenCore release zip; skipping validation." >&2
+fi
+
+# --- 6. Build the new FAT32 image ------------------------------------------
+
+echo "[6/7] Building 96 MiB FAT32 image..."
 PART_SECTORS=$(( (IMAGE_SIZE_MIB * 1024 * 1024 - 512) / 512 ))
 TOTAL_SECTORS=$(( IMAGE_SIZE_MIB * 1024 * 1024 / 512 ))
 TMP_IMG="$WORK/new.iso"
@@ -200,9 +263,9 @@ with open(path, 'r+b') as f:
     f.seek(0); f.write(mbr)
 PYEOF
 
-# --- 6. Replace the shipped ISO --------------------------------------------
+# --- 7. Replace the shipped ISO --------------------------------------------
 
-echo "[6/6] Installing new ISO at $OUT_ISO"
+echo "[7/7] Installing new ISO at $OUT_ISO"
 mv -f "$TMP_IMG" "$OUT_ISO"
 
 # Sanity check: re-read the volume via mtools from the final image.
@@ -211,4 +274,4 @@ drive z: file="$OUT_ISO" offset=512
 EOF
 MTOOLSRC="$WORK/mtoolsrc.verify" MTOOLS_SKIP_CHECK=1 mdir z:/EFI/OC | sed 's/^/  /'
 
-echo "Done. OpenCore=$OC_VERSION Lilu=$LILU_VERSION VirtualSMC=$VIRTUALSMC_VERSION WhateverGreen=$WHATEVERGREEN_VERSION"
+echo "Done. OpenCore=$OC_VERSION Lilu=$LILU_VERSION VirtualSMC=$VIRTUALSMC_VERSION WhateverGreen=$WHATEVERGREEN_VERSION RestrictEvents=$RESTRICTEVENTS_VERSION NVMeFix=$NVMEFIX_VERSION"

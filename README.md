@@ -49,14 +49,28 @@ sudo spctl --master-disable
 ✅ macOS Sequoia - 15  
 ✅ macOS Tahoe - 26  
 
-> **macOS Tahoe (26) notes.** The shipped OpenCore ISO defaults to the
-> `iMac20,1` SMBIOS, which is on Apple's Tahoe allow-list. Clean installs
-> work out of the box. Items from the Dortania Tahoe guide that are
-> **bare-metal only** (analog audio via AppleHDA/AppleALC, AMD dGPU connector
-> patching in WhateverGreen, Broadcom Wi-Fi, Intel Bluetooth) do not apply
-> to QEMU VMs. If you want OTA system updates on Tahoe, you must add
-> `RestrictEvents.kext` to your EFI and set `boot-args += revpatch=sbvmm` —
-> this is outside the default ISO to keep the VM footprint minimal.
+> **macOS Tahoe (26) notes.** Each VM gets its own OpenCore ISO
+> (`opencore-vm<ID>.iso`) generated at creation time, with a SMBIOS model
+> chosen for the target macOS version. Tahoe defaults to `MacPro7,1`
+> (Apple's Tahoe allow-list rejects `iMacPro1,1`, the default for every
+> other supported release); MacPro7,1's "memory modules misconfigured" nag
+> is silenced by the bundled `RestrictEvents.kext`. Override the model with
+> `OSX_SMBIOS_MODEL=<model> ./setup` or the per-VM prompt. Items from the
+> Dortania Tahoe guide that are **bare-metal only** (analog audio via
+> AppleHDA/AppleALC, Broadcom Wi-Fi, Intel Bluetooth) do not apply to QEMU
+> VMs. `WhateverGreen.kext` is capped at `MaxKernel=24.99.99` (disabled on
+> Tahoe/Darwin 25+) since Dortania documents its AMD GPU connector patching
+> as broken there — `agdpmod=pikera` becomes an inert boot-arg on Tahoe as a
+> result; GPU-passthrough users on Tahoe need to manage connector patching
+> themselves. `NVMeFix.kext` ships enabled for NVMe passthrough disks.
+>
+> **Apple ID / iMessage / FaceTime under KVM.** The shipped `config.plist`
+> includes a kernel patch (`MinKernel=24.0.0`, i.e. Sonoma and newer) that
+> masks `kern.hv_vmm_present` so Apple's attestation sees a physical
+> machine — this is what makes Apple ID and iMessage work inside a KVM
+> guest on Sequoia and Tahoe. `RestrictEvents.kext` and the `revpatch=sbvmm`
+> boot-arg ship alongside it so OTA system updates keep working once the
+> VMM is masked; no manual EFI edits needed.
 
 ---
 
@@ -64,7 +78,10 @@ sudo spctl --master-disable
 ✅ v7.0.XX ~ 9.1.XX
 
 ### 🔄 OpenCore Version
-- **April/2026 - 1.0.7** → Tahoe-capable kext injection (≥ 1.0.5) and XhciPortLimit fixes; ships Lilu 1.7.2, VirtualSMC 1.3.7, WhateverGreen 1.7.0. SIP enabled, DMG signed by Apple. Rebuild locally with `sudo tools/build-opencore-iso.sh`.
+- **April/2026 - 1.0.7** → Tahoe-capable kext injection (≥ 1.0.5) and XhciPortLimit fixes; ships Lilu 1.7.2, VirtualSMC 1.3.7, WhateverGreen 1.7.0 (capped `MaxKernel=24.99.99`), RestrictEvents 1.1.6, NVMeFix 1.1.3. SIP enabled, DMG signed by Apple. Rebuild locally with `sudo tools/build-opencore-iso.sh` (requires `mtools`, `dosfstools`, `xmlstarlet`, `curl`, `unzip`, `python3` on the build host — not required on the Proxmox host itself).
+
+### 💿 Per-VM OpenCore ISOs
+Each VM created by `setup` gets its own OpenCore ISO (`opencore-vm<VMID>.iso`) copied from the shared base image, with a freshly generated SMBIOS serial (`.smbios-vm<VMID>.json`) and a ROM derived from the VM's network MAC address — instead of every VM sharing one image, one config, and one hardcoded serial. If SMBIOS generation fails (GenSMBIOS needs network access), VM creation still succeeds using the shared ISO's defaults. Menu option **205** now lets you pick which ISO (base or per-VM) to customize, and **206** cleans up per-VM ISOs left behind after a VM is deleted (Proxmox doesn't remove ISO-storage volumes on VM destroy).
 
 ---
 
@@ -192,6 +209,16 @@ OSX_AMD_CPU_PROFILE=host         ./setup
 ```
 
 The chosen profile, detected Zen generation, and recommended default are logged to the per-VM log (`crt-vm-amd-<osname>.log`).
+
+### SMBIOS model override
+
+Each VM gets a per-VM OpenCore ISO with its own generated SMBIOS (see "Per-VM OpenCore ISOs" above). The default model is `MacPro7,1` for Tahoe and `iMacPro1,1` for every other release; override it non-interactively with:
+
+```bash
+OSX_SMBIOS_MODEL=iMac20,1 ./setup
+```
+
+or leave it unset to be prompted per-VM (Enter accepts the default).
 
 #### If every profile still freezes at the Apple logo
 

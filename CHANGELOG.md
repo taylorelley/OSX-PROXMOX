@@ -4,6 +4,51 @@ OpenCore Changelog
 #### Latest versions
 - Check history of commits
 
+#### 2026.08.19 – AMD/Tahoe VM hygiene improvements
+
+- **Per-VM OpenCore ISOs.** Every VM previously shared one OpenCore ISO and,
+  unless menu 201's SMBIOS step was run manually, one hardcoded serial
+  (`C02YG0KQHX87`) baked into the base image. `create_vm` now copies the
+  base ISO to `opencore-vm<VMID>.iso`, generates a fresh GenSMBIOS serial
+  for it, and sets its ROM from the VM's network MAC address. Falls back
+  gracefully to the shared ISO if SMBIOS generation fails (it needs network
+  access for `macserial`). New menu 206 cleans up per-VM ISOs orphaned by
+  VM deletion; menu 205 can now target either the base ISO or a per-VM ISO.
+- **Tahoe SMBIOS fix.** The default `iMacPro1,1` SMBIOS is not on Apple's
+  Tahoe (26) supported-model allow-list and is rejected by its installer.
+  Tahoe VMs now default to `MacPro7,1` (its "memory modules misconfigured"
+  nag is silenced by the newly-bundled `RestrictEvents.kext`); every other
+  release keeps `iMacPro1,1`. Override with `OSX_SMBIOS_MODEL`.
+- **Apple ID / iMessage / FaceTime under KVM.** Shipped `config.plist`
+  (base + all four `SOURCE/EFI-*` variants) now includes a kernel patch
+  (`MinKernel=24.0.0`) that masks `kern.hv_vmm_present`, so Apple's
+  attestation sees a physical machine — this was previously present as an
+  unused patch file in `Artefacts/Patches/BCM94360.../patch-bcm-virtual.plist`
+  and is now wired into the bundled configs. Ships with `RestrictEvents.kext`
+  and a `revpatch=sbvmm` boot-arg so OTA system updates keep working once
+  the VMM is masked.
+- **WhateverGreen capped on Tahoe.** `WhateverGreen.kext` now has
+  `MaxKernel=24.99.99` in all bundled configs — Dortania documents its AMD
+  GPU connector patching as broken on Tahoe (Darwin 25+); `agdpmod=pikera`
+  becomes an inert boot-arg there as a result.
+- **NVMeFix.kext** (1.1.3) is now installed and enabled for NVMe
+  passthrough disks.
+- **OpenCore ISO self-update fix.** Menu 201 (`update_opencore_iso`)
+  previously `rm -f`'d the existing ISO before downloading a replacement
+  from *upstream's* repo (`luchina-gabriel/OSX-PROXMOX`), discarding this
+  fork's OpenCore 1.0.7 build and stranding the host on any download
+  failure. It now prefers the local repo checkout, otherwise downloads
+  from this fork's URL to a temp file and moves it into place only on
+  success, and offers to refresh existing per-VM ISOs from the updated
+  base.
+- `tools/build-opencore-iso.sh` gained an idempotent `config.plist`
+  normalization pass (`tools/patch_config.py`) applied to the base config
+  and all four `SOURCE/EFI-*` variants — installs RestrictEvents/NVMeFix,
+  caps WhateverGreen, applies the VMM-mask patch, appends `revpatch=sbvmm`,
+  and rewrites the stale "OC 1.0.4"/"1.0.2" header comment — plus an
+  `ocvalidate` (OpenCore 1.0.7) validation step. Regenerated
+  `EFI/opencore-osx-proxmox-vm.iso` accordingly.
+
 #### 2026.04.21 – Tahoe refresh
 
 - Rebuilt `EFI/opencore-osx-proxmox-vm.iso` with OpenCore **1.0.7** (first OC
