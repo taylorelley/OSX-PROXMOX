@@ -7,9 +7,21 @@
 ![GitHub license](https://img.shields.io/github/license/taylorelley/osx-proxmox?style=flat-square)
 ![GitHub issues](https://img.shields.io/github/issues/taylorelley/osx-proxmox?style=flat-square)
 
-> This is a fork of [luchina-gabriel/OSX-PROXMOX](https://github.com/luchina-gabriel/OSX-PROXMOX) with additional Proxmox VE 9.1 support, a non-destructive installer for hosts with existing VMs/LXCs, macOS Tahoe support, AMD CPU profile detection, and per-VM OpenCore ISOs. See [CHANGELOG.md](CHANGELOG.md) for details.
+> This is a fork of [luchina-gabriel/OSX-PROXMOX](https://github.com/luchina-gabriel/OSX-PROXMOX) — all credit for the original tooling, EFI work, and macOS-on-Proxmox research goes to Gabriel Luchina and upstream's contributors. This fork builds on that base with Proxmox VE 9.1 support, a non-destructive installer for hosts with existing VMs/LXCs, macOS Tahoe support, AMD CPU profile detection, and per-VM OpenCore ISOs — see [CHANGELOG.md](CHANGELOG.md) for details. Development happens independently here, so expect this fork to keep diverging from upstream over time: some upstream fixes are deliberately not adopted (see the "Selectively adopt..." entries in the changelog) where they'd conflict with this fork's own fixes, and some fixes here may never be upstreamed.
 
 </div>
+
+## 📖 Table of Contents
+- [Installation Guide](#-installation-guide)
+- [Running on an Existing Proxmox Host](#-running-on-an-existing-proxmox-host)
+- [Additional Configuration](#-additional-configuration)
+- [macOS Versions Supported](#-macos-versions-supported)
+- [Proxmox VE Versions Supported](#-proxmox-ve-versions-supported)
+- [Cloud Support](#-cloud-support-run-hackintosh-in-the-cloud)
+- [Disclaimer](#-disclaimer)
+- [Requirements](#-requirements)
+- [Troubleshooting](#-troubleshooting)
+- [Credits](#-credits)
 
 ![v15 - Sequoia](https://github.com/user-attachments/assets/4efd8874-dbc8-48b6-a485-73f7c38a5e06)
 Easily install macOS on Proxmox VE with just a few steps! This guide provides the simplest and most effective way to set up macOS on Proxmox, whether you're using AMD or Intel hardware.
@@ -274,10 +286,13 @@ Every VM creation appends the VM config, `lscpu`, `dmesg | grep clocksource`, `k
 📽️ [Watch on YouTube](https://youtu.be/dil6iRWiun0)  
 *(Enable auto-translate captions for English subtitles!)*
 
+*Video and Discord community below are maintained by the upstream project.*
+
 ---
 
 ## 🎖 Credits
 
+- **[Gabriel Luchina](https://github.com/luchina-gabriel) & the [upstream OSX-PROXMOX](https://github.com/luchina-gabriel/OSX-PROXMOX) contributors** - Created and maintain the original project this fork is built on; this fork exists only because of their work
 - **OpenCore/Acidanthera Team** - Open-source bootloader
 - **Corpnewt** - Tools (ProperTree, GenSMBIOS, etc.)
 - **Apple** - macOS
