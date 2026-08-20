@@ -30,18 +30,13 @@ Easily install macOS on Proxmox VE with just a few steps! This guide provides th
 
 ## 🛠 Installation Guide
 
-1. Install a **FRESH/CLEAN** version of Proxmox VE (v7.0.XX ~ 9.1.XX) - just follow the Next, Next & Finish (NNF) approach.
+1. Have a Proxmox VE host (v7.0.XX ~ 9.1.XX) ready. A **FRESH/CLEAN** install is recommended — but this fork also supports installing OSX on an **existing** Proxmox host with VMs/LXCs already on it; see [Running on an Existing Proxmox Host](#-running-on-an-existing-proxmox-host) below before proceeding on a production system.
 2. Open the **Proxmox Web Console** → Navigate to `Datacenter > YOUR_HOST_NAME > Shell`.
 3. Copy, paste, and execute the command below:
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/taylorelley/OSX-PROXMOX/main/install.sh)"
 ```
-
-> ⚠️ The upstream `https://install.osx-proxmox.com` shortlink clones
-> [luchina-gabriel/OSX-PROXMOX](https://github.com/luchina-gabriel/OSX-PROXMOX), **not** this fork.
-> Use the raw GitHub URL above (which is what `install.sh` itself now clones — see
-> [CHANGELOG.md](CHANGELOG.md)) to get this fork's Proxmox 9.1, Tahoe, and safety fixes.
 
 🎉 Voilà! You can now install macOS!
 ![osx-terminal](https://github.com/user-attachments/assets/ea81b920-f3e2-422e-b1ff-0d9045adc55e)
